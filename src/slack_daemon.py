@@ -24,7 +24,12 @@ from slack_bolt.async_app import AsyncApp
 from slack_sdk.errors import SlackApiError
 
 import attachments
-from claude_handler import ClaudeHandler
+from claude_handler import (
+    ClaudeHandler,
+    _INTERRUPTED_REPLY,
+    _RUN_FAILURE_SENTINELS,
+    _TIMEOUT_REPLY,
+)
 from crash_recovery import recover_interrupted_runs
 from security import AccessControl, SecurityConfig
 from slack_markdown import build_markdown_payloads
@@ -32,6 +37,78 @@ from slack_markdown import build_markdown_payloads
 logger = logging.getLogger(__name__)
 
 SOCKET_PATH = "/tmp/slack-bridge.sock"
+
+# action_id of the 🛑 Stop button on the live status message. Clicking it routes
+# to _handle_stop_button (delivered over Socket Mode — requires Interactivity to
+# be enabled in the Slack app; no request URL is needed). The 🛑 *reaction* on
+# the trigger message remains as a no-config fallback.
+_STOP_ACTION_ID = "stop_run"
+
+# Replies that mean the run failed/stalled rather than producing an answer.
+# When one is returned, the live status message is removed so only the error
+# reply remains in the thread.
+_TERMINAL_ERRORS: frozenset[str] = _RUN_FAILURE_SENTINELS | {
+    _TIMEOUT_REPLY, _INTERRUPTED_REPLY,
+}
+
+
+class _ProgressReporter:
+    """Posts and live-edits ONE Slack status message for a running Claude job.
+
+    Handed to :class:`ClaudeHandler` as its ``progress_cb``. The first snapshot
+    creates the message; later snapshots edit it in place — no new posts, so no
+    thread spam. A ``done`` snapshot collapses it into the summary. On stop or
+    error the daemon calls :meth:`delete` so only the final reply remains.
+    """
+
+    def __init__(self, client: Any, channel: str, thread_ts: str) -> None:
+        self._client = client
+        self._channel = channel
+        self._thread_ts = thread_ts
+        self._status_ts: str | None = None
+
+    def _blocks(self, text: str, *, with_stop: bool) -> list[dict]:
+        """Status text as a section, plus a 🛑 Stop button while still running."""
+        blocks: list[dict] = [
+            {"type": "section", "text": {"type": "mrkdwn", "text": text}}
+        ]
+        if with_stop:
+            blocks.append({
+                "type": "actions",
+                "elements": [{
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "🛑 Stop", "emoji": True},
+                    "style": "danger",
+                    "action_id": _STOP_ACTION_ID,
+                    "value": self._thread_ts,  # what _handle_stop_button stops
+                }],
+            })
+        return blocks
+
+    async def __call__(self, progress: Any) -> None:
+        text = progress.summary if progress.done else progress.live
+        # Drop the button once the run is done (summary snapshot).
+        blocks = self._blocks(text, with_stop=not progress.done)
+        if self._status_ts is None:
+            resp = await self._client.chat_postMessage(
+                channel=self._channel, thread_ts=self._thread_ts, text=text, blocks=blocks,
+            )
+            self._status_ts = resp["ts"]
+        else:
+            await self._client.chat_update(
+                channel=self._channel, ts=self._status_ts, text=text, blocks=blocks,
+            )
+
+    async def delete(self) -> None:
+        """Remove the status message if one was posted. Best-effort."""
+        if self._status_ts is None:
+            return
+        try:
+            await self._client.chat_delete(channel=self._channel, ts=self._status_ts)
+        except Exception as exc:  # noqa: BLE001 — cleanup must not raise
+            logger.warning("Failed to delete status message %s: %s", self._status_ts, exc)
+        finally:
+            self._status_ts = None
 
 
 class SlackDaemon:
@@ -62,6 +139,7 @@ class SlackDaemon:
         self._app.event("message")(self._handle_slack_message)
         self._app.event("app_mention")(self._handle_app_mention)
         self._app.event("reaction_added")(self._handle_reaction_added)
+        self._app.action(_STOP_ACTION_ID)(self._handle_stop_button)
 
     async def _handle_slack_message(self, event: dict[str, Any]) -> None:
         # Filter: Ignore bot messages (prevents self-echo loops).
@@ -175,6 +253,30 @@ class SlackDaemon:
         except Exception as exc:
             logger.warning("Failed to post stop notice for %s: %s", thread_ts, exc)
 
+    async def _handle_stop_button(self, ack, body: dict) -> None:
+        """Stop a run when the 🛑 Stop button on its status message is clicked.
+
+        Mirrors the 🛑-reaction path: the button's ``value`` carries the run's
+        thread_ts, so we kill that run and post the stop notice. The run task
+        then deletes its (button-bearing) status message via the reporter.
+        """
+        await ack()  # acknowledge within Slack's 3s window before doing work
+        actions = body.get("actions") or []
+        thread_ts = actions[0].get("value") if actions else None
+        if not thread_ts:
+            return
+        channel = (body.get("channel") or {}).get("id", "")
+        killed = await self._claude.stop(thread_ts)
+        if not killed:
+            return  # nothing in flight (already finished / stopped)
+
+        try:
+            await self._app.client.chat_postMessage(
+                channel=channel, thread_ts=thread_ts, text="⏹️ Stopped."
+            )
+        except Exception as exc:
+            logger.warning("Failed to post stop notice for %s: %s", thread_ts, exc)
+
     async def _handle_claude_new_message(
         self, channel: str, message_ts: str, text: str, trigger_ts: str,
         raw_files: list[dict] | None = None,
@@ -183,17 +285,24 @@ class SlackDaemon:
         self._active_threads.add(message_ts)
         self._trigger_to_thread[trigger_ts] = message_ts
         await self._add_stop_reaction(channel, trigger_ts)
+        reporter = _ProgressReporter(self._app.client, channel, message_ts)
         try:
             files = await attachments.download_files(
                 raw_files or [], message_ts, self._bot_token
             )
-            response = await self._claude.handle_message(channel, message_ts, text, files)
+            response = await self._claude.handle_message(
+                channel, message_ts, text, files, progress_cb=reporter
+            )
             if message_ts in self._claude._stopped:
                 logger.info("Run for %s was stopped; suppressing reply.", message_ts)
+                await reporter.delete()
             else:
+                if response in _TERMINAL_ERRORS:
+                    await reporter.delete()
                 await self._deliver_response(channel, message_ts, response)
         except Exception as exc:
             logger.error("Error handling top-level message %s: %s", message_ts, exc)
+            await reporter.delete()
         finally:
             # Clear the stopped flag on EVERY exit path (incl. exceptions), so a
             # later run on this thread_ts is not silently suppressed.
@@ -210,17 +319,24 @@ class SlackDaemon:
         self._active_threads.add(thread_ts)
         self._trigger_to_thread[trigger_ts] = thread_ts
         await self._add_stop_reaction(channel, trigger_ts)
+        reporter = _ProgressReporter(self._app.client, channel, thread_ts)
         try:
             files = await attachments.download_files(
                 raw_files or [], thread_ts, self._bot_token
             )
-            response = await self._claude.handle_thread_reply(channel, thread_ts, text, files)
+            response = await self._claude.handle_thread_reply(
+                channel, thread_ts, text, files, progress_cb=reporter
+            )
             if thread_ts in self._claude._stopped:
                 logger.info("Run for %s was stopped; suppressing reply.", thread_ts)
+                await reporter.delete()
             else:
+                if response in _TERMINAL_ERRORS:
+                    await reporter.delete()
                 await self._deliver_response(channel, thread_ts, response)
         except Exception as exc:
             logger.error("Error in thread continuation %s: %s", thread_ts, exc)
+            await reporter.delete()
         finally:
             # Clear the stopped flag on EVERY exit path (incl. exceptions), so a
             # later run on this thread_ts is not silently suppressed.
