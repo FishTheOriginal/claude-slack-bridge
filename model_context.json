@@ -13,7 +13,7 @@
     "haiku": {"in": 1, "out": 5},
     "fable": {"in": 10, "out": 50},
     "mythos": {"in": 10, "out": 50},
-    "opus": {"in": 5, "out": 25},
-    "sonnet": {"in": 3, "out": 15}
+    "opus": {"in": 4, "out": 20},
+    "sonnet": {"in": 2, "out": 10}
   }
 }

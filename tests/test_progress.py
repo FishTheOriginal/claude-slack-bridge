@@ -214,14 +214,14 @@ def test_tracker_counts_compactions():
 def test_tracker_cost_estimate_format():
     # ≥ $1 → one decimal; < $1 → two decimals.
     big = _ProgressTracker(start=0.0)
-    big.ingest({"type": "assistant", "message": {"model": "claude-opus-4-8", "usage": {
+    big.ingest({"type": "assistant", "message": {"model": "claude-opus-5-5", "usage": {
         "input_tokens": 1000, "output_tokens": 100, "cache_read_input_tokens": 6_700_000}, "content": []}})
-    assert "($3.4)" in big.snapshot(now=1.0).meta
+    assert "($2.7)" in big.snapshot(now=1.0).meta
 
     small = _ProgressTracker(start=0.0)
-    small.ingest({"type": "assistant", "message": {"model": "claude-opus-4-8", "usage": {
+    small.ingest({"type": "assistant", "message": {"model": "claude-opus-5-5", "usage": {
         "input_tokens": 12000, "output_tokens": 4200, "cache_read_input_tokens": 368000}, "content": []}})
-    assert "($0.35)" in small.snapshot(now=1.0).meta
+    assert "($0.28)" in small.snapshot(now=1.0).meta
 
 
 def test_tracker_idle_hint_at_top_when_quiet():

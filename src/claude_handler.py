@@ -1184,6 +1184,9 @@ class ClaudeHandler:
             "--output-format", "stream-json",
             "--verbose",
         ]
+        model = os.environ.get("CLAUDE_MODEL")
+        if model:
+            cmd.extend(["--model", model])
         if plugin_dir:
             cmd.extend(["--plugin-dir", plugin_dir])
         if session_id:
