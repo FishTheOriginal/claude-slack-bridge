@@ -307,3 +307,44 @@ class TestChannelPick:
         env.write_text(json.dumps({"C1": {"path": str(tmp_path), "model": "haiku"}}))
         asyncio.run(h.reload_projects())
         assert h._effective_model("T9", "C1") == "haiku"
+
+
+FAIL = "Sorry, I encountered an error processing your request."
+
+
+class TestSwitchThatCannotRun:
+    def test_rerun_failing_twice_undoes_thread_pick_and_keeps_session(self, tmp_path, env):
+        h = with_thread(make(tmp_path, env, replies=["@@model thread claude-opus-9-9", FAIL, FAIL]), tmp_path)
+        reply = asyncio.run(h.handle_thread_reply("C1", "T1", "hi"))
+        assert len(h.runs) == 3                                   # no further retry / scrape
+        assert [model_flag(r["cmd"]) for r in h.runs[1:]] == ["claude-opus-9-9"] * 2
+        assert reply == FAIL + "\nCouldn't run on claude-opus-9-9, so the switch was undone; " \
+                               "this thread stays on the default model."
+        assert "T1" not in h._thread_model
+        assert session_store.load(tmp_path / "sessions.json")["T1"]["model"] is None
+        assert h._sessions["T1"] == "sid-1"
+
+    def test_rerun_failing_twice_undoes_channel_pick(self, tmp_path, env):
+        h = with_thread(make(tmp_path, env, replies=["@@model channel claude-x-1", FAIL, FAIL],
+                             mapping={"C1": str(tmp_path)}), tmp_path)
+        asyncio.run(h.handle_thread_reply("C1", "T1", "hi"))
+        assert json.loads(env.read_text()) == {"C1": str(tmp_path)}
+        assert h._channel_id_to_project["C1"]["model"] is None
+
+
+class TestChannelPickVsBigThread:
+    def test_big_thread_does_not_inherit_a_too_small_channel_pick(self, tmp_path, env):
+        h = make(tmp_path, env, replies=[], mapping={"C1": {"path": str(tmp_path), "model": "haiku"}})
+        h._thread_ctx["T1"] = 450_000
+        assert h._effective_model("T1", "C1") is None
+        assert h._effective_model("T2", "C1") == "haiku"
+
+    def test_channel_pick_from_big_thread_is_recorded_with_note(self, tmp_path, env):
+        h = with_thread(make(tmp_path, env, replies=["@@model channel haiku\nDone."],
+                             mapping={"C1": str(tmp_path)}), tmp_path)
+        h._thread_ctx["T1"] = 450_000
+        reply = asyncio.run(h.handle_thread_reply("C1", "T1", "make haiku the default"))
+        assert reply == "Done.\nhaiku is now this channel's default, but this thread stays put: " \
+                        "its context is ~450k tokens, more than haiku's 200k window."
+        assert json.loads(env.read_text()) == {"C1": {"path": str(tmp_path), "model": "haiku"}}
+        assert len(h.runs) == 1

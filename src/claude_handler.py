@@ -116,7 +116,12 @@ _CTX_TOO_BIG = (
     "Can't switch to {model}: this thread's context is ~{ctx} tokens, more than "
     "{model}'s {window} window."
 )
+_CTX_TOO_BIG_HERE = (
+    "{model} is now this channel's default, but this thread stays put: its context is "
+    "~{ctx} tokens, more than {model}'s {window} window."
+)
 _NO_CHANNEL_ENTRY = "This channel has no projects.json entry, so it can't hold a default model."
+_SWITCH_FAILED = "Couldn't run on {model}, so the switch was undone; this thread stays on {old}."
 _SWITCH_NOTE = "\n\n[Bridge: this session now runs on {model} — the switch is done; answer the message above.]"
 
 
@@ -1028,13 +1033,34 @@ class ClaudeHandler:
         return reply
 
     def _effective_model(self, thread_ts: str, channel: str) -> str | None:
-        """The ``--model`` for this thread: thread pick → channel pick → CLAUDE_MODEL → none."""
+        """The ``--model`` for this thread: thread pick → channel pick → CLAUDE_MODEL → none.
+
+        A channel pick is skipped for a thread whose context won't fit its window.
+        """
+        channel_model = self._channel_model(channel)
+        if channel_model and not self._ctx_fits(thread_ts, channel_model):
+            channel_model = None
         return (
             self._thread_model.get(thread_ts)
-            or (self._channel_id_to_project.get(channel) or {}).get("model")
+            or channel_model
             or os.environ.get("CLAUDE_MODEL")
             or None
         )
+
+    def _channel_model(self, channel: str) -> str | None:
+        return (self._channel_id_to_project.get(channel) or {}).get("model")
+
+    def _ctx_fits(self, thread_ts: str, model: str) -> bool:
+        """False when the thread's last context is bigger than *model*'s known window."""
+        window = _model_window(model)
+        return not window or self._thread_ctx.get(thread_ts, 0) <= window
+
+    def _set_thread_model(self, thread_ts: str, model: str | None) -> None:
+        if model:
+            self._thread_model[thread_ts] = model
+        else:
+            self._thread_model.pop(thread_ts, None)
+        session_store.upsert(thread_ts, model=model, path=self._store_path)
 
     async def _run_session(
         self, prompt: str, *, session_id: str, resume: bool, plugin_dir: str | None,
@@ -1045,6 +1071,8 @@ class ClaudeHandler:
         If the reply's markers change the effective model, that reply is dropped
         and the same message is re-run once on the same session with the new
         ``--model``; markers on the re-run are applied but never re-run again.
+        A re-run that fails twice undoes the pick, so a model the CLI can't run
+        (e.g. a made-up ``claude-…`` id) can't lock the thread.
         """
         model = self._effective_model(thread_ts, channel)
         if resume:
@@ -1054,6 +1082,7 @@ class ClaudeHandler:
         reply = await self._run_claude(
             cmd, prompt, cwd=cwd, thread_ts=thread_ts, channel=channel, progress_cb=progress_cb,
         )
+        prev_thread, prev_channel = self._thread_model.get(thread_ts), self._channel_model(channel)
         reply = await self._apply_model_markers(reply, thread_ts, channel)
         new_model = self._effective_model(thread_ts, channel)
         if new_model == model:
@@ -1061,18 +1090,31 @@ class ClaudeHandler:
         # The old model only acknowledged the switch; answer the same message on the new one.
         logger.info("Thread %s switched model %s → %s; re-running.", thread_ts, model, new_model)
         cmd = self._build_cmd(resume=session_id, plugin_dir=plugin_dir, model=new_model)
-        reply = await self._run_claude(
-            cmd, prompt + _SWITCH_NOTE.format(model=new_model or "the default model"),
-            cwd=cwd, thread_ts=thread_ts, channel=channel, progress_cb=progress_cb,
+        prompt += _SWITCH_NOTE.format(model=new_model or "the default model")
+        for _ in range(2):  # retry once: a transient failure shouldn't undo a good pick
+            reply = await self._run_claude(
+                cmd, prompt, cwd=cwd, thread_ts=thread_ts, channel=channel,
+                progress_cb=progress_cb,
+            )
+            if reply not in _RUN_FAILURE_SENTINELS:
+                return await self._apply_model_markers(reply, thread_ts, channel)
+        logger.warning("Thread %s can't run on %s; undoing the switch.", thread_ts, new_model)
+        if self._thread_model.get(thread_ts) != prev_thread:
+            self._set_thread_model(thread_ts, prev_thread)
+        if self._channel_model(channel) != prev_channel:
+            await self._set_channel_model(channel, prev_channel)
+        return reply + "\n" + _SWITCH_FAILED.format(
+            model=new_model or "the default model", old=model or "the default model",
         )
-        return await self._apply_model_markers(reply, thread_ts, channel)
 
     async def _apply_model_markers(self, reply: str, thread_ts: str, channel: str) -> str:
         """Strip ``@@model`` lines from *reply* and record each pick.
 
         A refused pick (unknown name, thread context bigger than the target's
         window, channel without a projects.json entry) changes nothing and adds
-        one plain sentence to the reply; an accepted pick adds nothing.
+        one plain sentence to the reply; an accepted pick adds nothing. A channel
+        pick too small for this thread's context is still recorded for the
+        channel, with a note that this thread stays put.
         """
         text, picks = _parse_model_markers(reply)
         if not picks:
@@ -1083,21 +1125,20 @@ class ClaudeHandler:
             if model and not _MODEL_NAME_RE.match(model):
                 notes.append(_NOT_A_MODEL.format(name=name))
                 continue
-            window = _model_window(model) if model else None
-            ctx = self._thread_ctx.get(thread_ts, 0)
-            if window and ctx > window:
-                notes.append(_CTX_TOO_BIG.format(
-                    model=model, ctx=_fmt_tokens(ctx), window=_fmt_tokens(window),
-                ))
-                continue
+            fits = model is None or self._ctx_fits(thread_ts, model)
+            sizes = {} if fits else {
+                "model": model, "ctx": _fmt_tokens(self._thread_ctx[thread_ts]),
+                "window": _fmt_tokens(_model_window(model)),
+            }
             if scope == "thread":
-                if model:
-                    self._thread_model[thread_ts] = model
-                else:
-                    self._thread_model.pop(thread_ts, None)
-                session_store.upsert(thread_ts, model=model, path=self._store_path)
+                if not fits:
+                    notes.append(_CTX_TOO_BIG.format(**sizes))
+                    continue
+                self._set_thread_model(thread_ts, model)
             elif not await self._set_channel_model(channel, model):
                 notes.append(_NO_CHANNEL_ENTRY)
+            elif not fits and thread_ts not in self._thread_model:
+                notes.append(_CTX_TOO_BIG_HERE.format(**sizes))
         return "\n".join([text, *notes]).strip()
 
     async def _set_channel_model(self, channel: str, model: str | None) -> bool:
