@@ -14,7 +14,9 @@ Record shape per thread_ts::
         "cwd": "/abs/project/path" | null,
         "plugin_dir": "/abs/plugin/path" | null,
         "in_flight": false,
-        "pid": null
+        "pid": null,
+        "model": "fable" | null,       # the thread's model pick
+        "ctx_tokens": 450000 | null    # prompt size of the last finished run
     }
 
 All writes are atomic: a temp file in the same directory is written and fsync'd,
@@ -32,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 SESSIONS_PATH = Path(__file__).parent.parent / "data" / "sessions.json"
 
-# Sentinel so callers can distinguish "don't touch pid" from "set pid to None".
+# Sentinel so callers can distinguish "don't touch pid/model" from "set it to None".
 _UNSET: Any = object()
 
 
@@ -44,6 +46,8 @@ def _default_record() -> dict[str, Any]:
         "in_flight": False,
         "pid": None,
         "channel": None,
+        "model": None,
+        "ctx_tokens": None,
     }
 
 
@@ -93,13 +97,16 @@ def upsert(
     channel: str | None = None,
     in_flight: bool | None = None,
     pid: Any = _UNSET,
+    model: Any = _UNSET,
+    ctx_tokens: int | None = None,
     path: Path | None = None,
 ) -> dict[str, dict]:
     """Merge the provided fields into ``thread_ts``'s record and persist.
 
     Only fields you pass are changed; omitted fields keep their stored value.
-    ``pid`` uses a sentinel default so ``pid=None`` can be written explicitly
-    (e.g. to clear a finished run) while omitting ``pid`` leaves it untouched.
+    ``pid`` and ``model`` use a sentinel default so ``None`` can be written
+    explicitly (e.g. to clear a finished run or a model pick) while omitting
+    them leaves them untouched.
 
     Returns the full updated map.
     """
@@ -118,6 +125,10 @@ def upsert(
         record["in_flight"] = in_flight
     if pid is not _UNSET:
         record["pid"] = pid
+    if model is not _UNSET:
+        record["model"] = model
+    if ctx_tokens is not None:
+        record["ctx_tokens"] = ctx_tokens
     data[thread_ts] = record
     save(data, path)
     return data

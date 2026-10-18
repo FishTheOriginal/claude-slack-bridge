@@ -66,6 +66,7 @@ class TestUpsert:
         assert data["T1"] == {
             "session_id": "s1", "cwd": "/c",
             "plugin_dir": None, "in_flight": False, "pid": None, "channel": None,
+            "model": None, "ctx_tokens": None,
         }
 
     def test_merges_only_provided_fields(self, tmp_path):
@@ -96,6 +97,17 @@ class TestUpsert:
         path = _p(tmp_path)
         data = session_store.upsert("T1", channel="C9", path=path)
         assert data["T1"]["channel"] == "C9"
+
+    def test_model_set_kept_and_cleared_with_sentinel(self, tmp_path):
+        path = _p(tmp_path)
+        assert session_store.upsert("T1", model="fable", path=path)["T1"]["model"] == "fable"
+        assert session_store.upsert("T1", in_flight=True, path=path)["T1"]["model"] == "fable"  # untouched
+        assert session_store.upsert("T1", model=None, path=path)["T1"]["model"] is None       # cleared
+
+    def test_can_store_ctx_tokens(self, tmp_path):
+        path = _p(tmp_path)
+        assert session_store.upsert("T1", ctx_tokens=450_000, path=path)["T1"]["ctx_tokens"] == 450_000
+        assert session_store.upsert("T1", in_flight=False, path=path)["T1"]["ctx_tokens"] == 450_000
 
 
 def test_sessions_path_is_under_repo_data_dir():
