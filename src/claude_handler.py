@@ -14,9 +14,10 @@ the channel to a project path and runs ``claude -p`` from that directory so
 Claude sees the project's CLAUDE.md and codebase.
 
 Each entry in ``projects.json`` can be a plain path string (legacy) or a dict
-with ``path`` and optional ``plugin_dir`` / ``worktrees`` fields. When
-``plugin_dir`` is set, ``--plugin-dir <dir>`` is prepended to the
+with ``path`` and optional ``plugin_dir`` / ``worktrees`` / ``model`` fields.
+When ``plugin_dir`` is set, ``--plugin-dir <dir>`` is prepended to the
 ``claude -p`` invocation so project-specific skills are loaded automatically.
+``model`` is the channel's default ``--model`` (a thread's own pick wins).
 
 When ``worktrees`` is a ``{label: path}`` map, users can route a top-level
 Slack message to a specific worktree by prefixing the message with
@@ -872,6 +873,10 @@ class ClaudeHandler:
         # thread_ts values the user stopped, so the daemon can suppress the
         # (partial) normal reply for that run.
         self._stopped: set[str] = set()
+        # thread_ts → the thread's model pick, and → prompt size of its last
+        # finished run (the model-switch context guard). Both persisted.
+        self._thread_model: dict[str, str] = {}
+        self._thread_ctx: dict[str, int] = {}
 
     async def initialize(self) -> None:
         """Cache the bot's own user ID and resolve channel names to IDs."""
@@ -884,6 +889,10 @@ class ClaudeHandler:
             if sid:
                 self._sessions[thread_ts] = sid
             self._thread_config[thread_ts] = (rec.get("cwd"), rec.get("plugin_dir"))
+            if rec.get("model"):
+                self._thread_model[thread_ts] = rec["model"]
+            if rec.get("ctx_tokens"):
+                self._thread_ctx[thread_ts] = rec["ctx_tokens"]
 
         if self._project_map:
             await self._resolve_channel_ids()
@@ -912,10 +921,9 @@ class ClaudeHandler:
         logger.info("New Claude session %s for thread %s", session_id, message_ts)
 
         prompt = _append_attachment_note(text, files or [])
-        cmd = self._build_cmd(session_id=session_id, plugin_dir=plugin_dir)
-        return await self._run_claude(
-            cmd, prompt, cwd=project_dir, thread_ts=message_ts, channel=channel,
-            progress_cb=progress_cb,
+        return await self._run_session(
+            prompt, session_id=session_id, resume=False, plugin_dir=plugin_dir,
+            cwd=project_dir, thread_ts=message_ts, channel=channel, progress_cb=progress_cb,
         )
 
     async def handle_thread_reply(
@@ -957,17 +965,16 @@ class ClaudeHandler:
         if session_id and _jsonl_path(project_dir, session_id).exists():
             logger.info("Resuming session %s for thread %s", session_id, thread_ts)
             prompt = _append_attachment_note(text, files or [])
-            cmd = self._build_cmd(resume=session_id, plugin_dir=plugin_dir)
-            reply = await self._run_claude(
-                cmd, prompt, cwd=project_dir, thread_ts=thread_ts, channel=channel,
-                progress_cb=progress_cb,
+            reply = await self._run_session(
+                prompt, session_id=session_id, resume=True, plugin_dir=plugin_dir,
+                cwd=project_dir, thread_ts=thread_ts, channel=channel, progress_cb=progress_cb,
             )
             if reply not in _RUN_FAILURE_SENTINELS:
                 return reply
             logger.warning("Resume of %s failed; retrying once.", session_id)
-            reply = await self._run_claude(
-                cmd, prompt, cwd=project_dir, thread_ts=thread_ts, channel=channel,
-                progress_cb=progress_cb,
+            reply = await self._run_session(
+                prompt, session_id=session_id, resume=True, plugin_dir=plugin_dir,
+                cwd=project_dir, thread_ts=thread_ts, channel=channel, progress_cb=progress_cb,
             )
             if reply not in _RUN_FAILURE_SENTINELS:
                 return reply
@@ -995,10 +1002,9 @@ class ClaudeHandler:
         prompt = await self._build_thread_prompt(channel, thread_ts)
         prompt = _append_attachment_note(prompt, files or [])
         new_id = str(uuid.uuid4())
-        cmd = self._build_cmd(session_id=new_id, plugin_dir=plugin_dir)
-        reply = await self._run_claude(
-            cmd, prompt, cwd=project_dir, thread_ts=thread_ts, channel=channel,
-            progress_cb=progress_cb,
+        reply = await self._run_session(
+            prompt, session_id=new_id, resume=False, plugin_dir=plugin_dir,
+            cwd=project_dir, thread_ts=thread_ts, channel=channel, progress_cb=progress_cb,
         )
         self._sessions[thread_ts] = new_id
         self._thread_config[thread_ts] = (project_dir, plugin_dir)
@@ -1007,6 +1013,29 @@ class ClaudeHandler:
             path=self._store_path,
         )
         return reply
+
+    def _effective_model(self, thread_ts: str, channel: str) -> str | None:
+        """The ``--model`` for this thread: thread pick → channel pick → CLAUDE_MODEL → none."""
+        return (
+            self._thread_model.get(thread_ts)
+            or (self._channel_id_to_project.get(channel) or {}).get("model")
+            or os.environ.get("CLAUDE_MODEL")
+            or None
+        )
+
+    async def _run_session(
+        self, prompt: str, *, session_id: str, resume: bool, plugin_dir: str | None,
+        cwd: str | None, thread_ts: str, channel: str, progress_cb: ProgressCb | None,
+    ) -> str:
+        """One ``claude -p`` run of *prompt* on the thread's effective model."""
+        model = self._effective_model(thread_ts, channel)
+        if resume:
+            cmd = self._build_cmd(resume=session_id, plugin_dir=plugin_dir, model=model)
+        else:
+            cmd = self._build_cmd(session_id=session_id, plugin_dir=plugin_dir, model=model)
+        return await self._run_claude(
+            cmd, prompt, cwd=cwd, thread_ts=thread_ts, channel=channel, progress_cb=progress_cb,
+        )
 
     async def stop(self, thread_ts: str) -> bool:
         """Kill the in-flight Flow-B subprocess for *thread_ts*, if any.
@@ -1138,13 +1167,19 @@ class ClaudeHandler:
             resolved: dict[str, dict] = {}
             for channel_key, value in self._project_map.items():
                 # Normalise the legacy string format and the dict format.
+                # "key" is the raw projects.json key, so a channel pick can be written back.
                 if isinstance(value, str):
-                    config = {"path": value, "plugin_dir": None, "worktrees": {}}
+                    config = {
+                        "path": value, "plugin_dir": None, "worktrees": {},
+                        "model": None, "key": channel_key,
+                    }
                 else:
                     config = {
                         "path": value.get("path"),
                         "plugin_dir": value.get("plugin_dir"),
                         "worktrees": value.get("worktrees") or {},
+                        "model": value.get("model"),
+                        "key": channel_key,
                     }
 
                 # DM channel IDs (D...) and raw channel IDs (C...) are not
@@ -1196,6 +1231,18 @@ class ClaudeHandler:
         "must be an absolute path that exists on disk); the bridge uploads each "
         "file to the Slack thread and removes the marker line from your reply, "
         "so write any accompanying explanation as normal text on other lines."
+        " The user can pick the Claude model for this thread or for the whole channel "
+        "in plain words (e.g. 'use Fable for this thread', 'switch to Opus', 'make "
+        "Haiku this channel's default', 'back to the default model'). When they do, "
+        "reply with ONLY a marker line — '@@model thread <model>' or '@@model channel "
+        "<model>', or '@@model thread default' / '@@model channel default' to clear a "
+        "pick — plus at most one short sentence, and do NOT start on the task: the "
+        "bridge switches the model and re-sends the same message to the new model, "
+        "which does the task. <model> is a CLI alias (opus, sonnet, haiku, fable, "
+        "best, opusplan, optionally with a [1m] suffix) or a full claude-... id. The "
+        "marker line is removed from the posted reply. If the user asks for the model "
+        "this session already runs on, there is nothing to switch — just do what they "
+        "asked."
     )
 
     @staticmethod
@@ -1203,19 +1250,25 @@ class ClaudeHandler:
         session_id: str | None = None,
         resume: str | None = None,
         plugin_dir: str | None = None,
+        model: str | None = None,
     ) -> list[str]:
         # stream-json + --verbose makes the CLI emit one event per line on
         # stdout (system/init, assistant text, thinking, tool_use,
         # tool_result, result). We log each event as it arrives so Docker
         # captures Claude's full trace, not just the final reply.
+        # The prompt names the session's model so Claude can tell a no-op
+        # "use <current model>" from a real switch.
+        system_prompt = (
+            ClaudeHandler._FLOW_B_SYSTEM_PROMPT
+            + f" This session currently runs on: {model or 'the default model'}."
+        )
         cmd = [
             "claude", "-p",
             "--dangerously-skip-permissions",
-            "--append-system-prompt", ClaudeHandler._FLOW_B_SYSTEM_PROMPT,
+            "--append-system-prompt", system_prompt,
             "--output-format", "stream-json",
             "--verbose",
         ]
-        model = os.environ.get("CLAUDE_MODEL")
         if model:
             cmd.extend(["--model", model])
         if plugin_dir:
@@ -1283,14 +1336,18 @@ class ClaudeHandler:
                 channel=channel, path=self._store_path,
             )
 
-        def _mark_finished() -> None:
+        def _mark_finished(ctx_tokens: int | None = None) -> None:
             # The subprocess has terminated (cleanly or with an error) — the run
             # is no longer in flight. Only a run that never reaches a terminal
             # path (the daemon itself dying mid-run) stays in_flight=true, which
             # is exactly what boot crash-recovery should surface.
+            # ctx_tokens (clean finish only) feeds the model-switch context guard.
             if thread_ts is not None:
+                if ctx_tokens:
+                    self._thread_ctx[thread_ts] = ctx_tokens
                 session_store.upsert(
-                    thread_ts, in_flight=False, pid=None, path=self._store_path
+                    thread_ts, in_flight=False, pid=None, ctx_tokens=ctx_tokens,
+                    path=self._store_path,
                 )
 
         try:
@@ -1405,7 +1462,7 @@ class ClaudeHandler:
             if progress_cb is not None and flushed_once:
                 with contextlib.suppress(Exception):
                     await progress_cb(tracker.snapshot(loop.time(), done=True))
-            _mark_finished()
+            _mark_finished(tracker.ctx_last or None)
             return final_result
         finally:
             if thread_ts is not None:
