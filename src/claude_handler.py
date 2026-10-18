@@ -1417,7 +1417,7 @@ class ClaudeHandler:
         "so write any accompanying explanation as normal text on other lines."
         " The user can pick the Claude model for this thread or for the whole channel "
         "in plain words (e.g. 'use Fable for this thread', 'switch to Opus', 'make "
-        "Haiku this channel's default', 'back to the default model'). When they do, "
+        "Haiku this channel's default', 'back to the default model', ...). When they do, "
         "reply with ONLY a marker line — '@@model thread <model>' or '@@model channel "
         "<model>', or '@@model thread default' / '@@model channel default' to clear a "
         "pick — plus at most one short sentence, and do NOT start on the task: the "
