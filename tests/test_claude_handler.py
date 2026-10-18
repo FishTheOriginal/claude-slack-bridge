@@ -354,21 +354,18 @@ class TestResumePolicy:
         assert len(h.runs) == 1
         assert "--resume" in h.runs[0]["cmd"]
 
-    def test_resume_retries_once_then_scrapes(self, tmp_path, monkeypatch):
-        # resume fails twice -> scrape succeeds (3 runs total)
+    def test_resume_failing_twice_keeps_the_session(self, tmp_path, monkeypatch):
+        # resume fails twice -> the error is returned; no scrape, same session id
         fail = "Sorry, I encountered an error processing your request."
         h = self._handler(tmp_path, replies=[fail, fail, "scraped-ok"])
         h._sessions["T1"] = "sid-1"
         h._thread_config["T1"] = ("/c", None)
         monkeypatch.setattr(claude_handler.Path, "exists", lambda self: True)
         reply = asyncio.run(h.handle_thread_reply("C", "T1", "hi"))
-        assert reply == claude_handler._NEW_SESSION_NOTE + "scraped-ok"
-        assert len(h.runs) == 3
-        # First two runs resume the old id; the third mints a NEW --session-id.
-        assert "--resume" in h.runs[0]["cmd"]
-        assert "--resume" in h.runs[1]["cmd"]
-        assert "--session-id" in h.runs[2]["cmd"]
-        assert "--resume" not in h.runs[2]["cmd"]
+        assert reply == fail
+        assert len(h.runs) == 2
+        assert all("--resume" in r["cmd"] for r in h.runs)
+        assert h._sessions["T1"] == "sid-1"
 
     def test_no_session_scrapes_and_persists_new_id(self, tmp_path):
         h = self._handler(tmp_path, replies=["scraped-ok"])
@@ -390,11 +387,14 @@ class TestResumePolicy:
         assert reply == claude_handler._NEW_SESSION_NOTE + "scraped-ok"
         assert "--session-id" in h.runs[0]["cmd"]
 
-    def test_failed_scrape_gets_no_new_session_note(self, tmp_path):
+    def test_failed_scrape_keeps_old_session_and_gets_no_note(self, tmp_path, monkeypatch):
         fail = "Sorry, I encountered an error processing your request."
         h = self._handler(tmp_path, replies=[fail])
+        h._sessions["T1"] = "sid-gone"
         h._thread_config["T1"] = ("/c", None)
+        monkeypatch.setattr(claude_handler.Path, "exists", lambda self: False)
         assert asyncio.run(h.handle_thread_reply("C", "T1", "hi")) == fail
+        assert h._sessions["T1"] == "sid-gone"
 
     def test_interrupted_reply_is_not_retried(self, tmp_path, monkeypatch):
         # When _run_claude returns _INTERRUPTED_REPLY (signal kill), the resume

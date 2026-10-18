@@ -900,7 +900,8 @@ class ClaudeHandler:
 
         Policy ("scrape once, then resume forever"):
           1. session_id present AND its jsonl exists  -> --resume; on failure
-             retry once; if it still fails -> scrape fallback.
+             retry once; if it still fails -> return the error and keep the
+             session (login/overload/CLI errors would sink a new session too).
           2. session_id present but jsonl missing      -> scrape fallback.
           3. no session_id                             -> scrape fallback.
         """
@@ -942,9 +943,9 @@ class ClaudeHandler:
                 cmd, prompt, cwd=project_dir, thread_ts=thread_ts, channel=channel,
                 progress_cb=progress_cb,
             )
-            if reply not in _RUN_FAILURE_SENTINELS:
-                return reply
-            logger.warning("Resume of %s failed twice; scraping thread history.", session_id)
+            if reply in _RUN_FAILURE_SENTINELS:
+                logger.warning("Resume of %s failed twice; keeping the session.", session_id)
+            return reply
         else:
             logger.info(
                 "No resumable session for thread %s (session_id=%s) — scraping.",
@@ -973,13 +974,15 @@ class ClaudeHandler:
             cmd, prompt, cwd=project_dir, thread_ts=thread_ts, channel=channel,
             progress_cb=progress_cb,
         )
+        if reply in _RUN_FAILURE_SENTINELS:
+            return reply  # the new session never ran; don't swap it in
         self._sessions[thread_ts] = new_id
         self._thread_config[thread_ts] = (project_dir, plugin_dir)
         session_store.upsert(
             thread_ts, session_id=new_id, cwd=project_dir, plugin_dir=plugin_dir,
             path=self._store_path,
         )
-        if reply not in _RUN_FAILURE_SENTINELS and reply not in (_TIMEOUT_REPLY, _INTERRUPTED_REPLY):
+        if reply not in (_TIMEOUT_REPLY, _INTERRUPTED_REPLY):
             reply = _NEW_SESSION_NOTE + reply
         return reply
 
