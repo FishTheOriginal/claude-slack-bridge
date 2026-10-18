@@ -76,6 +76,11 @@ _WORKTREE_TAG_RE = re.compile(r"^[\s*_~]*\[([^\]]+)\]\s*")
 # Labels become directory names; restrict to a safe alphabet to block
 # path-traversal attempts like ``[../etc]``.
 _SAFE_LABEL_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+# A ``@@model <thread|channel> <model|default>`` line Claude emits to switch the
+# model; tolerates a stray pair of backticks (the model sometimes code-formats it).
+_MODEL_MARKER_RE = re.compile(r"^\s*`?@@model\s+(thread|channel)\s+([^\s`]+)`?\s*$", re.IGNORECASE)
+# Model names the claude CLI accepts for --model: aliases or full ids, optional [1m].
+_MODEL_NAME_RE = re.compile(r"^(?:opus|sonnet|haiku|fable|best|opusplan|claude-[a-z0-9.-]+)(?:\[1m\])?$")
 
 # A claude -p run that failed transiently (CLI missing, non-zero rc, or no
 # result event) returns one of these fixed user-facing strings from
@@ -130,6 +135,23 @@ def _parse_worktree_tag(text: str) -> tuple[str | None, str]:
         return None, text
     remaining = text[match.end() :]
     return label, remaining
+
+
+def _parse_model_markers(reply: str) -> tuple[str, list[tuple[str, str]]]:
+    """Split *reply* into (clean_text, [(scope, name), ...]).
+
+    ``@@model <thread|channel> <model|default>`` lines are removed and collected
+    in order (lower-cased); the rest is rejoined and stripped, like ``@@attach``.
+    """
+    kept: list[str] = []
+    picks: list[tuple[str, str]] = []
+    for line in reply.splitlines():
+        m = _MODEL_MARKER_RE.match(line)
+        if m:
+            picks.append((m.group(1).lower(), m.group(2).lower()))
+        else:
+            kept.append(line)
+    return "\n".join(kept).strip(), picks
 
 
 def _resolve_dynamic_worktree(default_path: str, label: str) -> str | None:
@@ -418,12 +440,17 @@ def _short_model(model: str) -> str:
     return model[len("claude-"):] if model.startswith("claude-") else model
 
 
-def _model_context(model: str) -> int:
+def _model_window(model: str) -> int | None:
+    """Context window for *model* by family substring, or None if no key matches."""
     m = (model or "").lower()
     for key, size in _MODEL_CONTEXT.items():
         if key in m:
             return size
-    return _DEFAULT_CONTEXT
+    return None
+
+
+def _model_context(model: str) -> int:
+    return _model_window(model) or _DEFAULT_CONTEXT
 
 
 def _model_price(model: str) -> "tuple[float, float] | None":
@@ -516,6 +543,10 @@ class _ProgressTracker:
     @property
     def dirty(self) -> bool:
         return self._dirty
+
+    @property
+    def ctx_last(self) -> int:
+        return self._ctx_last
 
     def _push(self, action: str) -> None:
         """Record the newest action, collapsing consecutive duplicates."""
