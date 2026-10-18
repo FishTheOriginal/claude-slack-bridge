@@ -68,16 +68,25 @@ def load(path: Path | None = None) -> dict[str, dict]:
     return data
 
 
-def save(data: dict[str, dict], path: Path | None = None) -> None:
-    """Atomically write *data* as JSON (temp file + os.replace)."""
+def save(
+    data: dict[str, dict], path: Path | None = None, *,
+    ensure_ascii: bool = True, mode: int | None = None,
+) -> None:
+    """Atomically write *data* as JSON (temp file + os.replace).
+
+    ``ensure_ascii=False`` keeps non-ASCII text as UTF-8 instead of ``\\u``
+    escapes; *mode* sets the file's permission bits (the temp file is 0600).
+    """
     path = path or SESSIONS_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".sessions-", suffix=".tmp")
     try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(data, f, indent=2)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=ensure_ascii)
             f.flush()
             os.fsync(f.fileno())
+        if mode is not None:
+            os.chmod(tmp, mode)
         os.replace(tmp, path)
     except BaseException:
         # Don't leave a temp file behind if the write/replace fails.

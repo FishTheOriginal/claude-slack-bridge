@@ -34,6 +34,7 @@ import os
 import re
 import session_store
 import signal
+import stat
 import uuid
 from collections import deque
 from pathlib import Path
@@ -93,6 +94,19 @@ _RUN_FAILURE_SENTINELS = frozenset({
     "Sorry, I couldn't parse the response.",
 })
 
+# A non-zero exit may append a classified reason to this stem (e.g. "… (rate
+# limited — try again shortly)"). The exact stem stays in _RUN_FAILURE_SENTINELS
+# so a bare failure still matches; the prefix lets the resume policy recognise the
+# enriched variants too. The stem is long and specific enough that a genuine
+# model reply never starts with it.
+_RUN_FAILURE_PREFIX = "Sorry, I encountered an error processing your request."
+
+
+def _is_run_failure(reply: str) -> bool:
+    """True for any _run_claude failure reply, plain or reason-enriched."""
+    return reply in _RUN_FAILURE_SENTINELS or reply.startswith(_RUN_FAILURE_PREFIX)
+
+
 # A run terminated by a signal (returncode < 0 — e.g. an OOM kill or a
 # deliberate stop) is NOT a transient failure: retrying it just re-executes work
 # that was intentionally or unavoidably halted. Surface a distinct reply that the
@@ -106,8 +120,9 @@ _INTERRUPTED_REPLY = "Sorry, the run was interrupted before it finished."
 # NOT in _RUN_FAILURE_SENTINELS.
 _TIMEOUT_REPLY = "Sorry, the run stalled with no activity and was stopped. Try again or break it into a smaller step."
 
-# Notes appended to the posted reply when an @@model marker is refused, and the
-# line appended to the re-sent message once a switch is done (see _run_session).
+# Notes appended to the posted reply when an @@model marker is refused or the
+# re-run after a pick fails, and the line appended to the re-sent message once a
+# pick is recorded (see _run_session).
 _NOT_A_MODEL = (
     "`{name}` isn't a model I can switch to. Use opus, sonnet, haiku, fable, best or "
     "opusplan (optionally with [1m]), or a full claude-… id."
@@ -121,8 +136,13 @@ _CTX_TOO_BIG_HERE = (
     "~{ctx} tokens, more than {model}'s {window} window."
 )
 _NO_CHANNEL_ENTRY = "This channel has no projects.json entry, so it can't hold a default model."
+_PROJECTS_UNWRITABLE = (
+    "Couldn't update projects.json (it isn't valid JSON or can't be written), so the "
+    "channel default is unchanged."
+)
 _SWITCH_FAILED = "Couldn't run on {model}, so the switch was undone; this thread stays on {old}."
-_SWITCH_NOTE = "\n\n[Bridge: this session now runs on {model} — the switch is done; answer the message above.]"
+_RERUN_FAILED = "The model pick is saved, but the run after it failed; please send the message again."
+_SWITCH_NOTE = "\n\n[Bridge: the model pick is saved; this session runs on {model}. Now answer the message above.]"
 
 
 def _jsonl_path(cwd: str | None, session_id: str) -> Path:
@@ -173,6 +193,11 @@ def _parse_model_markers(reply: str) -> tuple[str, list[tuple[str, str]]]:
     return "\n".join(kept).strip(), picks
 
 
+def _join_notes(text: str, notes: list[str]) -> str:
+    """*text* followed by one line per bridge note; unchanged when there are none."""
+    return "\n".join([text, *notes]).strip() if notes else text
+
+
 def _resolve_dynamic_worktree(default_path: str, label: str) -> str | None:
     """Resolve *label* to a sibling worktree directory of *default_path*.
 
@@ -201,7 +226,7 @@ def _load_project_map() -> dict[str, Any]:
     if not PROJECTS_CONFIG.exists():
         logger.warning("No projects.json at %s — project detection disabled.", PROJECTS_CONFIG)
         return {}
-    with open(PROJECTS_CONFIG) as f:
+    with open(PROJECTS_CONFIG, encoding="utf-8") as f:
         mapping = json.load(f)
     logger.info("Loaded project map with %d entries.", len(mapping))
     return mapping
@@ -987,14 +1012,14 @@ class ClaudeHandler:
                 prompt, session_id=session_id, resume=True, plugin_dir=plugin_dir,
                 cwd=project_dir, thread_ts=thread_ts, channel=channel, progress_cb=progress_cb,
             )
-            if reply not in _RUN_FAILURE_SENTINELS:
+            if not _is_run_failure(reply):
                 return reply
             logger.warning("Resume of %s failed; retrying once.", session_id)
             reply = await self._run_session(
                 prompt, session_id=session_id, resume=True, plugin_dir=plugin_dir,
                 cwd=project_dir, thread_ts=thread_ts, channel=channel, progress_cb=progress_cb,
             )
-            if reply not in _RUN_FAILURE_SENTINELS:
+            if not _is_run_failure(reply):
                 return reply
             logger.warning("Resume of %s failed twice; scraping thread history.", session_id)
         else:
@@ -1068,11 +1093,13 @@ class ClaudeHandler:
     ) -> str:
         """Run *prompt* on the thread's effective model, applying ``@@model`` picks.
 
-        If the reply's markers change the effective model, that reply is dropped
-        and the same message is re-run once on the same session with the new
-        ``--model``; markers on the re-run are applied but never re-run again.
-        A re-run that fails twice undoes the pick, so a model the CLI can't run
-        (e.g. a made-up ``claude-…`` id) can't lock the thread.
+        A reply that records a pick only acknowledged it (the system prompt says
+        so), so it is dropped and the same message is re-run once on the same
+        session with the — possibly unchanged — effective ``--model``; markers on
+        the re-run are applied but never re-run again. Notes on refused picks
+        are kept either way. A re-run that fails twice undoes a pick that changed
+        the model, so a model the CLI can't run (e.g. a made-up ``claude-…`` id)
+        can't lock the thread.
         """
         model = self._effective_model(thread_ts, channel)
         if resume:
@@ -1083,12 +1110,12 @@ class ClaudeHandler:
             cmd, prompt, cwd=cwd, thread_ts=thread_ts, channel=channel, progress_cb=progress_cb,
         )
         prev_thread, prev_channel = self._thread_model.get(thread_ts), self._channel_model(channel)
-        reply = await self._apply_model_markers(reply, thread_ts, channel)
+        text, notes, picked = await self._apply_model_markers(reply, thread_ts, channel)
+        if not picked:
+            return _join_notes(text, notes)
+        # The old run only acknowledged the pick; answer the same message after it.
         new_model = self._effective_model(thread_ts, channel)
-        if new_model == model:
-            return reply
-        # The old model only acknowledged the switch; answer the same message on the new one.
-        logger.info("Thread %s switched model %s → %s; re-running.", thread_ts, model, new_model)
+        logger.info("Thread %s picked a model (%s → %s); re-running.", thread_ts, model, new_model)
         cmd = self._build_cmd(resume=session_id, plugin_dir=plugin_dir, model=new_model)
         prompt += _SWITCH_NOTE.format(model=new_model or "the default model")
         for _ in range(2):  # retry once: a transient failure shouldn't undo a good pick
@@ -1096,30 +1123,39 @@ class ClaudeHandler:
                 cmd, prompt, cwd=cwd, thread_ts=thread_ts, channel=channel,
                 progress_cb=progress_cb,
             )
-            if reply not in _RUN_FAILURE_SENTINELS:
-                return await self._apply_model_markers(reply, thread_ts, channel)
+            if not _is_run_failure(reply):
+                text, more, _ = await self._apply_model_markers(reply, thread_ts, channel)
+                return _join_notes(text, notes + more)
+        # The bridge note goes first, so the resume policy doesn't retry this reply.
+        if new_model == model:
+            return _join_notes(_RERUN_FAILED + "\n" + reply, notes)
         logger.warning("Thread %s can't run on %s; undoing the switch.", thread_ts, new_model)
         if self._thread_model.get(thread_ts) != prev_thread:
             self._set_thread_model(thread_ts, prev_thread)
         if self._channel_model(channel) != prev_channel:
             await self._set_channel_model(channel, prev_channel)
-        return reply + "\n" + _SWITCH_FAILED.format(
+        failed = _SWITCH_FAILED.format(
             model=new_model or "the default model", old=model or "the default model",
         )
+        return _join_notes(failed + "\n" + reply, notes)
 
-    async def _apply_model_markers(self, reply: str, thread_ts: str, channel: str) -> str:
+    async def _apply_model_markers(
+        self, reply: str, thread_ts: str, channel: str,
+    ) -> tuple[str, list[str], bool]:
         """Strip ``@@model`` lines from *reply* and record each pick.
 
-        A refused pick (unknown name, thread context bigger than the target's
-        window, channel without a projects.json entry) changes nothing and adds
-        one plain sentence to the reply; an accepted pick adds nothing. A channel
+        Returns ``(text, notes, picked)``: the reply without marker lines, one
+        plain sentence per refused pick (unknown name, thread context bigger
+        than the target's window, a channel pick that can't be stored — none of
+        which changes anything), and whether any pick was recorded. A channel
         pick too small for this thread's context is still recorded for the
         channel, with a note that this thread stays put.
         """
         text, picks = _parse_model_markers(reply)
         if not picks:
-            return reply
+            return reply, [], False
         notes: list[str] = []
+        picked = False
         for scope, name in picks:
             model = None if name == "default" else name
             if model and not _MODEL_NAME_RE.match(model):
@@ -1135,36 +1171,49 @@ class ClaudeHandler:
                     notes.append(_CTX_TOO_BIG.format(**sizes))
                     continue
                 self._set_thread_model(thread_ts, model)
-            elif not await self._set_channel_model(channel, model):
-                notes.append(_NO_CHANNEL_ENTRY)
-            elif not fits and thread_ts not in self._thread_model:
-                notes.append(_CTX_TOO_BIG_HERE.format(**sizes))
-        return "\n".join([text, *notes]).strip()
+            else:
+                refused = await self._set_channel_model(channel, model)
+                if refused:
+                    notes.append(refused)
+                    continue
+                if not fits and thread_ts not in self._thread_model:
+                    notes.append(_CTX_TOO_BIG_HERE.format(**sizes))
+            picked = True
+        return text, notes, picked
 
-    async def _set_channel_model(self, channel: str, model: str | None) -> bool:
+    async def _set_channel_model(self, channel: str, model: str | None) -> str | None:
         """Write (or, for None, remove) ``"model"`` on the channel's projects.json entry.
 
-        Applied live via ``reload_projects``. Returns False when the channel has
-        no projects.json entry to hold it.
+        Applied live via ``reload_projects``. Returns None once written, or a
+        note for the user when nothing changed: the channel has no projects.json
+        entry, or the file can't be read (e.g. malformed) or written.
         """
         key = (self._channel_id_to_project.get(channel) or {}).get("key")
         if not key:
-            return False
-        mapping = _load_project_map()
-        if key not in mapping:
-            return False
-        entry = mapping[key]
-        if isinstance(entry, str):
-            entry = {"path": entry}
-        if model:
-            entry["model"] = model
-        else:
-            entry.pop("model", None)
-        # A plain-string entry collapses back once only its path is left.
-        mapping[key] = entry["path"] if set(entry) == {"path"} else entry
-        session_store.save(mapping, PROJECTS_CONFIG)  # atomic temp + fsync + replace
+            return _NO_CHANNEL_ENTRY
+        try:
+            mapping = _load_project_map()
+            if key not in mapping:
+                return _NO_CHANNEL_ENTRY
+            entry = mapping[key]
+            if isinstance(entry, str):
+                entry = {"path": entry}
+            if model:
+                entry["model"] = model
+            else:
+                entry.pop("model", None)
+            # A plain-string entry collapses back once only its path is left.
+            mapping[key] = entry["path"] if set(entry) == {"path"} else entry
+            # Atomic temp + fsync + replace, keeping the file's mode and non-ASCII keys.
+            session_store.save(
+                mapping, PROJECTS_CONFIG, ensure_ascii=False,
+                mode=stat.S_IMODE(PROJECTS_CONFIG.stat().st_mode),
+            )
+        except (OSError, ValueError) as exc:  # ValueError covers JSONDecodeError
+            logger.warning("Couldn't set channel %s model in %s: %s", channel, PROJECTS_CONFIG, exc)
+            return _PROJECTS_UNWRITABLE
         await self.reload_projects()
-        return True
+        return None
 
     async def stop(self, thread_ts: str) -> bool:
         """Kill the in-flight Flow-B subprocess for *thread_ts*, if any.
@@ -1303,11 +1352,17 @@ class ClaudeHandler:
                         "model": None, "key": channel_key,
                     }
                 else:
+                    model = value.get("model")
+                    if model is not None and not (isinstance(model, str) and _MODEL_NAME_RE.match(model)):
+                        logger.warning(
+                            "Channel %s: ignoring invalid model %r in projects.json.", channel_key, model,
+                        )
+                        model = None
                     config = {
                         "path": value.get("path"),
                         "plugin_dir": value.get("plugin_dir"),
                         "worktrees": value.get("worktrees") or {},
-                        "model": value.get("model"),
+                        "model": model,
                         "key": channel_key,
                     }
 

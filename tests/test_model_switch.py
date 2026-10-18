@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import stat
 
 import pytest
 
@@ -20,7 +21,10 @@ class FakeSlack:
 
 
 class SpyHandler(ClaudeHandler):
-    """Scripted _run_claude: records (cmd, prompt), pops the next reply."""
+    """Scripted _run_claude: records (cmd, prompt), pops the next reply.
+
+    A callable reply is called with the handler (to fake a run's side effects).
+    """
     def __init__(self, *a, replies, **k):
         super().__init__(*a, **k)
         self.runs: list[dict] = []
@@ -28,7 +32,8 @@ class SpyHandler(ClaudeHandler):
 
     async def _run_claude(self, cmd, prompt, cwd=None, thread_ts=None, channel=None, progress_cb=None):
         self.runs.append({"cmd": cmd, "prompt": prompt})
-        return self._scripted.pop(0)
+        reply = self._scripted.pop(0)
+        return reply(self) if callable(reply) else reply
 
 
 @pytest.fixture
@@ -146,6 +151,14 @@ class TestEffectiveModel:
         assert h._channel_id_to_project["C1"]["model"] is None
         assert h._channel_id_to_project["C1"]["key"] == "C1"
 
+    @pytest.mark.parametrize("bad", ["Fable5", "gpt-4", 5, ["opus"]])
+    def test_invalid_hand_edited_model_is_ignored(self, tmp_path, env, bad, caplog):
+        h = make(tmp_path, env, replies=[], mapping={
+            "C1": {"path": str(tmp_path), "model": bad}, "C2": {"path": str(tmp_path), "model": "haiku"}})
+        assert h._channel_id_to_project["C1"]["model"] is None    # ignored, channel still mapped
+        assert h._channel_id_to_project["C2"]["model"] == "haiku"  # other channels unaffected
+        assert "invalid model" in caplog.text
+
 
 class TestRunsUseEffectiveModel:
     def test_handle_message_passes_env_model_when_no_pick(self, tmp_path, env, monkeypatch):
@@ -203,7 +216,7 @@ class TestThreadSwitch:
         assert model_flag(h.runs[0]["cmd"]) is None
         assert model_flag(h.runs[1]["cmd"]) == "fable"
         assert h.runs[1]["cmd"][h.runs[1]["cmd"].index("--resume") + 1] == "sid-1"
-        assert h.runs[1]["prompt"].startswith("use fable: do X\n\n[Bridge: this session now runs on fable")
+        assert h.runs[1]["prompt"].startswith("use fable: do X\n\n[Bridge: the model pick is saved; this session runs on fable.")
         assert h._thread_model["T1"] == "fable"
         assert session_store.load(tmp_path / "sessions.json")["T1"]["model"] == "fable"
 
@@ -215,11 +228,34 @@ class TestThreadSwitch:
         assert h.runs[1]["cmd"][h.runs[1]["cmd"].index("--resume") + 1] == sid
         assert model_flag(h.runs[1]["cmd"]) == "fable"
 
-    def test_noop_marker_single_run_reply_stripped(self, tmp_path, env):
-        h = with_thread(make(tmp_path, env, replies=["@@model thread fable\nAlready on it."]), tmp_path)
+    def test_marker_for_current_model_still_reruns_once(self, tmp_path, env):
+        # A marker means the old run only acknowledged (as the prompt tells it), so
+        # the task in the same message is answered by the re-run, even with no change.
+        h = with_thread(make(tmp_path, env, replies=["@@model thread fable\nAlready on it.", "did X"]), tmp_path)
         h._thread_model["T1"] = "fable"
-        assert asyncio.run(h.handle_thread_reply("C1", "T1", "hi")) == "Already on it."
+        assert asyncio.run(h.handle_thread_reply("C1", "T1", "use fable: do X")) == "did X"
+        assert [model_flag(r["cmd"]) for r in h.runs] == ["fable", "fable"]
+
+    def test_markerless_reply_is_never_rerun_even_if_ctx_outgrew_channel_pick(self, tmp_path, env):
+        # The run itself grows the context past the channel pick's window (as
+        # _mark_finished does), which changes the effective model — but no pick
+        # was made, so the reply stands and the task isn't run twice.
+        def grows(h):
+            h._thread_ctx["T1"] = 450_000
+            return "answer"
+        h = with_thread(make(tmp_path, env, replies=[grows, "second run"],
+                             mapping={"C1": {"path": str(tmp_path), "model": "haiku"}}), tmp_path)
+        h._thread_ctx["T1"] = 100_000
+        assert asyncio.run(h.handle_thread_reply("C1", "T1", "do X")) == "answer"
         assert len(h.runs) == 1
+
+    def test_thread_default_when_thread_pick_equals_channel_pick_reruns(self, tmp_path, env):
+        h = with_thread(make(tmp_path, env, replies=["@@model thread default", "did X"],
+                             mapping={"C1": {"path": str(tmp_path), "model": "fable"}}), tmp_path)
+        h._thread_model["T1"] = "fable"
+        assert asyncio.run(h.handle_thread_reply("C1", "T1", "back to default, then do X")) == "did X"
+        assert [model_flag(r["cmd"]) for r in h.runs] == ["fable", "fable"]
+        assert "T1" not in h._thread_model
 
     def test_default_clears_pick_and_reruns_without_flag(self, tmp_path, env):
         h = with_thread(make(tmp_path, env, replies=["@@model thread default", "back"]), tmp_path)
@@ -294,13 +330,36 @@ class TestChannelPick:
         asyncio.run(h.handle_thread_reply("C1", "T1", "back"))
         assert json.loads(env.read_text()) == {"C1": {"path": str(tmp_path), "plugin_dir": "/x"}}
 
-    def test_thread_pick_shadows_channel_pick_so_no_rerun(self, tmp_path, env):
-        h = with_thread(make(tmp_path, env, replies=["@@model channel haiku\nDone."],
+    def test_channel_pick_shadowed_by_thread_pick_still_answers_the_task(self, tmp_path, env):
+        h = with_thread(make(tmp_path, env, replies=["@@model channel haiku\nDone.", "did X"],
                              mapping={"C1": str(tmp_path)}), tmp_path)
         h._thread_model["T1"] = "opus"
-        assert asyncio.run(h.handle_thread_reply("C1", "T1", "hi")) == "Done."
-        assert len(h.runs) == 1
+        assert asyncio.run(h.handle_thread_reply("C1", "T1", "make haiku the default, then do X")) == "did X"
+        assert [model_flag(r["cmd"]) for r in h.runs] == ["opus", "opus"]  # this thread keeps its pick
+        assert "the model pick is saved; this session runs on opus." in h.runs[1]["prompt"]
         assert h._channel_id_to_project["C1"]["model"] == "haiku"  # still recorded for other threads
+
+    def test_projects_json_keeps_file_mode_and_non_ascii(self, tmp_path, env):
+        h = make(tmp_path, env, replies=["@@model channel fable", "ok"],
+                 mapping={"C1": str(tmp_path), "#café": "/x"})
+        with_thread(h, tmp_path)
+        env.chmod(0o664)
+        asyncio.run(h.handle_thread_reply("C1", "T1", "make fable the default"))
+        assert stat.S_IMODE(env.stat().st_mode) == 0o664
+        raw = env.read_text(encoding="utf-8")
+        assert '"#café"' in raw and "\\u00e9" not in raw
+        assert json.loads(raw)["C1"] == {"path": str(tmp_path), "model": "fable"}
+
+    def test_malformed_projects_json_changes_nothing_and_tells_user(self, tmp_path, env):
+        h = with_thread(make(tmp_path, env, replies=["@@model channel fable\nDone.", "unexpected"],
+                             mapping={"C1": str(tmp_path)}), tmp_path)
+        env.write_text("{not json")
+        reply = asyncio.run(h.handle_thread_reply("C1", "T1", "make fable the default"))
+        assert reply == "Done.\nCouldn't update projects.json (it isn't valid JSON or can't be " \
+                        "written), so the channel default is unchanged."
+        assert env.read_text() == "{not json"
+        assert h._channel_id_to_project["C1"]["model"] is None
+        assert len(h.runs) == 1
 
     def test_hand_edited_model_applies_after_reload(self, tmp_path, env):
         h = make(tmp_path, env, replies=[], mapping={"C1": str(tmp_path)})
@@ -318,11 +377,37 @@ class TestSwitchThatCannotRun:
         reply = asyncio.run(h.handle_thread_reply("C1", "T1", "hi"))
         assert len(h.runs) == 3                                   # no further retry / scrape
         assert [model_flag(r["cmd"]) for r in h.runs[1:]] == ["claude-opus-9-9"] * 2
-        assert reply == FAIL + "\nCouldn't run on claude-opus-9-9, so the switch was undone; " \
-                               "this thread stays on the default model."
+        assert reply == "Couldn't run on claude-opus-9-9, so the switch was undone; " \
+                        "this thread stays on the default model.\n" + FAIL
         assert "T1" not in h._thread_model
         assert session_store.load(tmp_path / "sessions.json")["T1"]["model"] is None
         assert h._sessions["T1"] == "sid-1"
+
+    def test_reason_enriched_failure_counts_as_a_failed_rerun(self, tmp_path, env):
+        # daily's _run_claude appends a classified reason to the failure stem.
+        enriched = FAIL + " (rate limited — try again shortly)"
+        h = with_thread(make(tmp_path, env, replies=["@@model thread claude-opus-9-9", enriched, enriched]),
+                        tmp_path)
+        reply = asyncio.run(h.handle_thread_reply("C1", "T1", "hi"))
+        assert len(h.runs) == 3
+        assert "T1" not in h._thread_model
+        assert reply.startswith("Couldn't run on claude-opus-9-9, so the switch was undone")
+
+    def test_reason_enriched_failure_is_retried_by_the_resume_policy(self, tmp_path, env):
+        h = with_thread(make(tmp_path, env, replies=[FAIL + " (overloaded)", "ok"]), tmp_path)
+        assert asyncio.run(h.handle_thread_reply("C1", "T1", "hi")) == "ok"
+        assert len(h.runs) == 2
+
+    def test_failed_rerun_on_unchanged_model_keeps_the_pick(self, tmp_path, env):
+        h = with_thread(make(tmp_path, env, replies=["@@model channel haiku", FAIL, FAIL],
+                             mapping={"C1": str(tmp_path)}), tmp_path)
+        h._thread_model["T1"] = "opus"
+        reply = asyncio.run(h.handle_thread_reply("C1", "T1", "make haiku the default, then do X"))
+        assert len(h.runs) == 3                                   # no further retry / scrape
+        assert reply == "The model pick is saved, but the run after it failed; " \
+                        "please send the message again.\n" + FAIL
+        assert h._channel_id_to_project["C1"]["model"] == "haiku"
+        assert h._thread_model["T1"] == "opus"
 
     def test_rerun_failing_twice_undoes_channel_pick(self, tmp_path, env):
         h = with_thread(make(tmp_path, env, replies=["@@model channel claude-x-1", FAIL, FAIL],
@@ -340,11 +425,11 @@ class TestChannelPickVsBigThread:
         assert h._effective_model("T2", "C1") == "haiku"
 
     def test_channel_pick_from_big_thread_is_recorded_with_note(self, tmp_path, env):
-        h = with_thread(make(tmp_path, env, replies=["@@model channel haiku\nDone."],
+        h = with_thread(make(tmp_path, env, replies=["@@model channel haiku\nDone.", "did X"],
                              mapping={"C1": str(tmp_path)}), tmp_path)
         h._thread_ctx["T1"] = 450_000
-        reply = asyncio.run(h.handle_thread_reply("C1", "T1", "make haiku the default"))
-        assert reply == "Done.\nhaiku is now this channel's default, but this thread stays put: " \
+        reply = asyncio.run(h.handle_thread_reply("C1", "T1", "make haiku the default, then do X"))
+        assert reply == "did X\nhaiku is now this channel's default, but this thread stays put: " \
                         "its context is ~450k tokens, more than haiku's 200k window."
         assert json.loads(env.read_text()) == {"C1": {"path": str(tmp_path), "model": "haiku"}}
-        assert len(h.runs) == 1
+        assert [model_flag(r["cmd"]) for r in h.runs] == [None, None]  # re-run answers the task
