@@ -106,6 +106,19 @@ _INTERRUPTED_REPLY = "Sorry, the run was interrupted before it finished."
 # NOT in _RUN_FAILURE_SENTINELS.
 _TIMEOUT_REPLY = "Sorry, the run stalled with no activity and was stopped. Try again or break it into a smaller step."
 
+# Notes appended to the posted reply when an @@model marker is refused, and the
+# line appended to the re-sent message once a switch is done (see _run_session).
+_NOT_A_MODEL = (
+    "`{name}` isn't a model I can switch to. Use opus, sonnet, haiku, fable, best or "
+    "opusplan (optionally with [1m]), or a full claude-… id."
+)
+_CTX_TOO_BIG = (
+    "Can't switch to {model}: this thread's context is ~{ctx} tokens, more than "
+    "{model}'s {window} window."
+)
+_NO_CHANNEL_ENTRY = "This channel has no projects.json entry, so it can't hold a default model."
+_SWITCH_NOTE = "\n\n[Bridge: this session now runs on {model} — the switch is done; answer the message above.]"
+
 
 def _jsonl_path(cwd: str | None, session_id: str) -> Path:
     """Local JSONL path for a Claude session.
@@ -1027,15 +1040,90 @@ class ClaudeHandler:
         self, prompt: str, *, session_id: str, resume: bool, plugin_dir: str | None,
         cwd: str | None, thread_ts: str, channel: str, progress_cb: ProgressCb | None,
     ) -> str:
-        """One ``claude -p`` run of *prompt* on the thread's effective model."""
+        """Run *prompt* on the thread's effective model, applying ``@@model`` picks.
+
+        If the reply's markers change the effective model, that reply is dropped
+        and the same message is re-run once on the same session with the new
+        ``--model``; markers on the re-run are applied but never re-run again.
+        """
         model = self._effective_model(thread_ts, channel)
         if resume:
             cmd = self._build_cmd(resume=session_id, plugin_dir=plugin_dir, model=model)
         else:
             cmd = self._build_cmd(session_id=session_id, plugin_dir=plugin_dir, model=model)
-        return await self._run_claude(
+        reply = await self._run_claude(
             cmd, prompt, cwd=cwd, thread_ts=thread_ts, channel=channel, progress_cb=progress_cb,
         )
+        reply = await self._apply_model_markers(reply, thread_ts, channel)
+        new_model = self._effective_model(thread_ts, channel)
+        if new_model == model:
+            return reply
+        # The old model only acknowledged the switch; answer the same message on the new one.
+        logger.info("Thread %s switched model %s → %s; re-running.", thread_ts, model, new_model)
+        cmd = self._build_cmd(resume=session_id, plugin_dir=plugin_dir, model=new_model)
+        reply = await self._run_claude(
+            cmd, prompt + _SWITCH_NOTE.format(model=new_model or "the default model"),
+            cwd=cwd, thread_ts=thread_ts, channel=channel, progress_cb=progress_cb,
+        )
+        return await self._apply_model_markers(reply, thread_ts, channel)
+
+    async def _apply_model_markers(self, reply: str, thread_ts: str, channel: str) -> str:
+        """Strip ``@@model`` lines from *reply* and record each pick.
+
+        A refused pick (unknown name, thread context bigger than the target's
+        window, channel without a projects.json entry) changes nothing and adds
+        one plain sentence to the reply; an accepted pick adds nothing.
+        """
+        text, picks = _parse_model_markers(reply)
+        if not picks:
+            return reply
+        notes: list[str] = []
+        for scope, name in picks:
+            model = None if name == "default" else name
+            if model and not _MODEL_NAME_RE.match(model):
+                notes.append(_NOT_A_MODEL.format(name=name))
+                continue
+            window = _model_window(model) if model else None
+            ctx = self._thread_ctx.get(thread_ts, 0)
+            if window and ctx > window:
+                notes.append(_CTX_TOO_BIG.format(
+                    model=model, ctx=_fmt_tokens(ctx), window=_fmt_tokens(window),
+                ))
+                continue
+            if scope == "thread":
+                if model:
+                    self._thread_model[thread_ts] = model
+                else:
+                    self._thread_model.pop(thread_ts, None)
+                session_store.upsert(thread_ts, model=model, path=self._store_path)
+            elif not await self._set_channel_model(channel, model):
+                notes.append(_NO_CHANNEL_ENTRY)
+        return "\n".join([text, *notes]).strip()
+
+    async def _set_channel_model(self, channel: str, model: str | None) -> bool:
+        """Write (or, for None, remove) ``"model"`` on the channel's projects.json entry.
+
+        Applied live via ``reload_projects``. Returns False when the channel has
+        no projects.json entry to hold it.
+        """
+        key = (self._channel_id_to_project.get(channel) or {}).get("key")
+        if not key:
+            return False
+        mapping = _load_project_map()
+        if key not in mapping:
+            return False
+        entry = mapping[key]
+        if isinstance(entry, str):
+            entry = {"path": entry}
+        if model:
+            entry["model"] = model
+        else:
+            entry.pop("model", None)
+        # A plain-string entry collapses back once only its path is left.
+        mapping[key] = entry["path"] if set(entry) == {"path"} else entry
+        session_store.save(mapping, PROJECTS_CONFIG)  # atomic temp + fsync + replace
+        await self.reload_projects()
+        return True
 
     async def stop(self, thread_ts: str) -> bool:
         """Kill the in-flight Flow-B subprocess for *thread_ts*, if any.
