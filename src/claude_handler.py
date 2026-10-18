@@ -100,6 +100,10 @@ _INTERRUPTED_REPLY = "Sorry, the run was interrupted before it finished."
 # NOT in _RUN_FAILURE_SENTINELS.
 _TIMEOUT_REPLY = "Sorry, the run stalled with no activity and was stopped. Try again or break it into a smaller step."
 
+# Prepended to a reply produced by the scrape fallback, so the user knows the
+# thread's session was replaced and only the Slack messages carried over.
+_NEW_SESSION_NOTE = "⚠️ New session: I couldn't resume the earlier one, so I only have this thread's messages, not my earlier work.\n\n"
+
 
 def _jsonl_path(cwd: str | None, session_id: str) -> Path:
     """Local JSONL path for a Claude session.
@@ -975,6 +979,8 @@ class ClaudeHandler:
             thread_ts, session_id=new_id, cwd=project_dir, plugin_dir=plugin_dir,
             path=self._store_path,
         )
+        if reply not in _RUN_FAILURE_SENTINELS and reply not in (_TIMEOUT_REPLY, _INTERRUPTED_REPLY):
+            reply = _NEW_SESSION_NOTE + reply
         return reply
 
     async def stop(self, thread_ts: str) -> bool:

@@ -362,7 +362,7 @@ class TestResumePolicy:
         h._thread_config["T1"] = ("/c", None)
         monkeypatch.setattr(claude_handler.Path, "exists", lambda self: True)
         reply = asyncio.run(h.handle_thread_reply("C", "T1", "hi"))
-        assert reply == "scraped-ok"
+        assert reply == claude_handler._NEW_SESSION_NOTE + "scraped-ok"
         assert len(h.runs) == 3
         # First two runs resume the old id; the third mints a NEW --session-id.
         assert "--resume" in h.runs[0]["cmd"]
@@ -374,7 +374,7 @@ class TestResumePolicy:
         h = self._handler(tmp_path, replies=["scraped-ok"])
         h._thread_config["T1"] = ("/c", None)  # known cwd, but no session_id
         reply = asyncio.run(h.handle_thread_reply("C", "T1", "hi"))
-        assert reply == "scraped-ok"
+        assert reply == claude_handler._NEW_SESSION_NOTE + "scraped-ok"
         assert len(h.runs) == 1
         assert "--session-id" in h.runs[0]["cmd"]
         new_id = h._sessions["T1"]
@@ -387,8 +387,14 @@ class TestResumePolicy:
         h._thread_config["T1"] = ("/c", None)
         monkeypatch.setattr(claude_handler.Path, "exists", lambda self: False)
         reply = asyncio.run(h.handle_thread_reply("C", "T1", "hi"))
-        assert reply == "scraped-ok"
+        assert reply == claude_handler._NEW_SESSION_NOTE + "scraped-ok"
         assert "--session-id" in h.runs[0]["cmd"]
+
+    def test_failed_scrape_gets_no_new_session_note(self, tmp_path):
+        fail = "Sorry, I encountered an error processing your request."
+        h = self._handler(tmp_path, replies=[fail])
+        h._thread_config["T1"] = ("/c", None)
+        assert asyncio.run(h.handle_thread_reply("C", "T1", "hi")) == fail
 
     def test_interrupted_reply_is_not_retried(self, tmp_path, monkeypatch):
         # When _run_claude returns _INTERRUPTED_REPLY (signal kill), the resume
