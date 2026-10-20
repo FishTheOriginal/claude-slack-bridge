@@ -86,6 +86,14 @@ Just add a line to `projects.json` and restart the daemon. No changes to `docker
 }
 ```
 
+**Optional `model`** — the channel's default Claude model (a CLI alias such as `fable`, `opus`, `haiku`, optionally `[1m]`, or a full `claude-…` id). Set it by hand and `./reload-mapping.sh`, or just tell the bot "make Fable this channel's default" — it writes this key itself.
+
+```json
+{
+  "#my-project": { "path": "/path/to/project", "model": "fable" }
+}
+```
+
 Both formats can coexist in the same file. See `projects.json.example` for a full template.
 
 ### `plugin_dir` — loading Claude Code skills

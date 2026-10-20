@@ -66,7 +66,15 @@ class TestUpsert:
         assert data["T1"] == {
             "session_id": "s1", "cwd": "/c",
             "plugin_dir": None, "in_flight": False, "pid": None, "channel": None,
+            "ctx_pct": None, "ctx_nudged": 0, "cum_cost": 0.0,
+            "model": None, "ctx_tokens": None,
         }
+
+    def test_cum_cost_accumulates_and_persists(self, tmp_path):
+        path = _p(tmp_path)
+        session_store.upsert("T1", cum_cost=3.44, path=path)
+        session_store.upsert("T1", cum_cost=3.44 + 2.10, path=path)  # caller sums unrounded
+        assert session_store.load(path)["T1"]["cum_cost"] == 5.54
 
     def test_merges_only_provided_fields(self, tmp_path):
         path = _p(tmp_path)
@@ -97,7 +105,31 @@ class TestUpsert:
         data = session_store.upsert("T1", channel="C9", path=path)
         assert data["T1"]["channel"] == "C9"
 
+    def test_model_set_kept_and_cleared_with_sentinel(self, tmp_path):
+        path = _p(tmp_path)
+        assert session_store.upsert("T1", model="fable", path=path)["T1"]["model"] == "fable"
+        assert session_store.upsert("T1", in_flight=True, path=path)["T1"]["model"] == "fable"  # untouched
+        assert session_store.upsert("T1", model=None, path=path)["T1"]["model"] is None       # cleared
+
+    def test_can_store_ctx_tokens(self, tmp_path):
+        path = _p(tmp_path)
+        assert session_store.upsert("T1", ctx_tokens=450_000, path=path)["T1"]["ctx_tokens"] == 450_000
+        assert session_store.upsert("T1", in_flight=False, path=path)["T1"]["ctx_tokens"] == 450_000
+
 
 def test_sessions_path_is_under_repo_data_dir():
     assert session_store.SESSIONS_PATH.name == "sessions.json"
     assert session_store.SESSIONS_PATH.parent.name == "data"
+
+
+def test_upsert_ctx_fields_and_defaults(tmp_path):
+    path = _p(tmp_path)
+    session_store.upsert("T", ctx_pct=55, path=path)
+    rec = session_store.load(path)["T"]
+    assert rec["ctx_pct"] == 55 and rec["ctx_nudged"] == 0
+    session_store.upsert("T", ctx_nudged=2, path=path)  # band index
+    assert session_store.load(path)["T"]["ctx_nudged"] == 2
+    # omitting them leaves both untouched
+    session_store.upsert("T", in_flight=True, path=path)
+    rec = session_store.load(path)["T"]
+    assert rec["ctx_pct"] == 55 and rec["ctx_nudged"] == 2

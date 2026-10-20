@@ -19,7 +19,9 @@ SECURITY_LOG_UNAUTHORIZED   Emit a warning log on each denial; default "true".
 """
 
 import logging
+import math
 import os
+import re
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
@@ -152,3 +154,111 @@ class AccessControl:
                 "Access denied: user_id=%s channel_id=%s reason=%s",
                 user_id, channel_id, reason,
             )
+
+
+# ---------------------------------------------------------------------------
+# Secret redaction
+#
+# The live status ticker and error replies echo command lines, URLs and stderr,
+# any of which can carry credentials. redact_secrets() masks the common shapes
+# before that text is shown in Slack. It leans toward over-redaction on purpose:
+# a hidden token is a cosmetic loss, a leaked one is a real one.
+# ---------------------------------------------------------------------------
+
+REDACTED = "[redacted]"
+
+# Standalone provider key formats — masked whole, no surrounding context needed.
+_SECRET_TOKENS: list[re.Pattern] = [
+    re.compile(r"xox[baprs]-[A-Za-z0-9-]{8,}"),          # Slack bot/user tokens
+    re.compile(r"xapp-[A-Za-z0-9-]{8,}"),                # Slack app-level token
+    re.compile(r"sk-(?:ant-)?[A-Za-z0-9_-]{16,}"),       # OpenAI / Anthropic keys
+    re.compile(r"gh[pousr]_[A-Za-z0-9]{20,}"),           # GitHub tokens
+    re.compile(r"github_pat_[A-Za-z0-9_]{20,}"),         # GitHub fine-grained PAT
+    re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),        # AWS access key id
+    re.compile(r"AIza[0-9A-Za-z_-]{20,}"),               # Google API key
+    re.compile(r"eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+"),  # JWT
+]
+
+# (pattern, group-number-holding-the-secret). Only that group is replaced, so the
+# surrounding context (the key name, the flag, the header) stays readable. Order
+# matters: bearer/basic runs before the header rule so the token (not just the
+# scheme word) gets masked.
+_SECRET_PAIRS: list[tuple[re.Pattern, int]] = [
+    # bearer / basic credential after the scheme word.
+    (re.compile(r"(?i)\b(?:bearer|basic)\s+([A-Za-z0-9._~+/=-]{16,})"), 1),
+    # HTTP auth headers: Authorization: <value>, X-Api-Key: <value>.
+    (re.compile(r"(?i)\b(?:authorization|proxy-authorization|x-api-key|x-auth-token)"
+                r"\s*:\s*(\S+)"), 1),
+    # key=value / key: value where the key names a credential.
+    (re.compile(
+        r"(?i)\b(?:pass(?:word|wd)?|secret|token|api[_-]?key|apikey|access[_-]?key"
+        r"|auth(?:[_-]?token)?|client[_-]?secret|private[_-]?key|session[_-]?token)"
+        r"\s*[=:]\s*('[^']*'|\"[^\"]*\"|\S+)"), 1),
+    # Env-var names ending in a credential word (e.g. ANTHROPIC_API_KEY=,
+    # GITHUB_TOKEN=, DB_PASSWORD=) — the leading "_" guards against words that
+    # merely end in "key" (e.g. monkey). Masks the value regardless of entropy.
+    (re.compile(r"(?i)\b[A-Za-z][A-Za-z0-9]*(?:_[A-Za-z0-9]+)*"
+                r"_(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|PWD|CREDENTIALS?|APIKEY)"
+                r"\s*[=:]\s*('[^']*'|\"[^\"]*\"|\S+)"), 1),
+    # Long-form CLI credential flags: --password VALUE / --token=VALUE.
+    (re.compile(r"(?i)--(?:password|pass|secret|token|api[_-]?key)(?:=|\s+)(\S+)"), 1),
+]
+
+# Generic unnamed tokens (e.g. ``T=ogk2r42…``) that no name/format rule covers.
+# One principled axis instead of hand-tuned shape rules: an assignment value is
+# masked only when it's both long enough and high-entropy (random-looking). Real
+# tokens clear the bar; ``RUN=build-2026-06-30``, paths and words don't. Tunable
+# via the two knobs below — raise them to redact less, lower to redact more.
+_ENTROPY_MIN_LEN = 20         # values shorter than this are left alone
+# Shannon bits/char. Measured separation: structured values (paths ~4.0, version
+# strings ~4.0, dated build ids ~3.7) sit below this; random tokens (~4.7+) clear
+# it. 4.2 keeps ``OUT=/home/…`` and ``v1.2.3-…`` readable while masking ``T=ogk2…``.
+_ENTROPY_MIN_BITS = 4.2
+_ASSIGN_RE = re.compile(r"(?<![\w/.-])([A-Za-z_]\w{0,40})=([^\s'\"]{%d,})" % _ENTROPY_MIN_LEN)
+
+
+def _shannon_entropy(s: str) -> float:
+    """Shannon entropy of *s* in bits per character (0 for empty/uniform)."""
+    if not s:
+        return 0.0
+    counts: dict[str, int] = {}
+    for ch in s:
+        counts[ch] = counts.get(ch, 0) + 1
+    n = len(s)
+    return -sum((c / n) * math.log2(c / n) for c in counts.values())
+
+
+def _mask_high_entropy_assign(m: "re.Match") -> str:
+    """Mask ``NAME=value`` only when the value looks like a random token."""
+    name, value = m.group(1), m.group(2)
+    if _shannon_entropy(value) >= _ENTROPY_MIN_BITS:
+        return f"{name}={REDACTED}"
+    return m.group(0)
+
+
+def redact_secrets(text: str) -> str:
+    """Mask credential-looking substrings in *text* for safe display.
+
+    Covers ``key=value`` / ``key: value`` credential pairs, HTTP auth headers,
+    ``bearer``/``basic`` schemes, CLI password flags, high-entropy env values,
+    and known provider key formats (Slack, OpenAI/Anthropic, GitHub, AWS,
+    Google, JWT). Returns *text* unchanged when nothing matches.
+    """
+    if not text:
+        return text
+    for pat in _SECRET_TOKENS:
+        text = pat.sub(REDACTED, text)
+    for pat, grp in _SECRET_PAIRS:
+        text = pat.sub(lambda m, g=grp: _mask_group(m, g), text)
+    # Named/formatted secrets are masked above regardless of entropy; this last
+    # pass catches the unnamed high-entropy leftovers without over-redacting.
+    text = _ASSIGN_RE.sub(_mask_high_entropy_assign, text)
+    return text
+
+
+def _mask_group(m: "re.Match", group: int) -> str:
+    """Replace only *group* of match *m* with REDACTED, keeping the rest."""
+    whole = m.group(0)
+    a = m.start(group) - m.start()
+    b = m.end(group) - m.start()
+    return whole[:a] + REDACTED + whole[b:]

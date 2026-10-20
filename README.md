@@ -17,7 +17,9 @@ Slack @bot   ──────────────────▶  claude -
 
 - **`ask_on_slack` MCP tool** — Claude pauses mid-task, posts a question to Slack, blocks until you reply in the thread, then resumes. Multiple concurrent sessions are routed correctly by `thread_ts`.
 - **Project-aware Slack bot** — `@claude-bot` in a Slack channel spawns `claude -p` in the matching project directory inside the container. Supports git worktrees via a `[label]` prefix.
-- **Stop a running task** — react with 🛑 to the message that started a run and the bot kills it (and everything it spawned), posts `⏹️ Stopped.`, and drops the partial reply.
+- **Pick the model in plain words** — "use Fable for this thread", "make Haiku this channel's default", "back to the default model". The thread keeps its session and history; a channel default applies to new threads (and to running ones without their own pick) and is stored as `"model"` on the channel's `projects.json` entry. Thread → channel → `CLAUDE_MODEL` → Claude Code's default. A switch to a model whose context window is smaller than the thread's current context is refused with the numbers (such a thread also skips a too-small channel default), and a switch whose first run on the new model fails twice is undone.
+- **Live progress, no timeout** — a run has no wall-clock limit; it works until it finishes or you stop it. While it runs, the bot edits one status message in the thread: a todo checklist, recent actions (newest first, up to 99/update), a changed-files section with per-file `+/−` churn, and a grey resource line (per-tool breakdown, subagents, skills used, MCP servers, compaction count, errors, tokens in/out/cache + **estimated cost**, context used/window + %, turns, model, elapsed) — all derived from the CLI's event stream with no extra model calls. Actions are numbered (newest = highest, on top). A quiet run shows an `⏳ idle` hint (`IDLE_HINT_SECONDS`); a genuinely stuck one (no activity for `IDLE_TIMEOUT_SECONDS`) is killed. When it finishes, the message keeps the full panel with a `✅ Done` headline on top (the whole greyed section stays — nothing is collapsed away). Per-model context windows and prices live in `model_context.json`. Turn the live message off with `LIVE_PROGRESS=false` (stop then falls back to the 🛑 reaction). Preview the layout locally with `tools/preview_status.py`.
+- **Stop a running task** — react with 🛑 to the live status message (the bot pre-adds the 🛑 there) or to the message that started the run. Either way the bot kills it (and everything it spawned), posts `⏹️ Stopped.`, and drops the partial reply. No Slack Interactivity setup needed — it's a plain reaction.
 - **Full-process plugin** — a turnkey feature-development workflow driven from Slack (`/process start` → pick a task → worktree → design → plan → run-plan → PR per step).
 
 ---
@@ -102,6 +104,15 @@ Map each Slack channel to a project folder:
 }
 ```
 
+**Apply mapping edits without a restart:** `projects.json` is read once at startup. After editing it, reload it live — keeping the Slack connection and any in-flight runs alive — instead of restarting:
+
+```bash
+./reload-mapping.sh        # → "reloaded N channel(s)"
+kill -HUP <daemon-pid>     # no CLI needed; same effect, no confirmation line
+```
+
+The reload affects only *new* threads; conversations already running stay in the directory they started in. See **[docs/reloading-projects.md](docs/reloading-projects.md)**.
+
 ### 3. Rebuild
 
 ```bash
@@ -118,9 +129,12 @@ The bot replies in a thread. Continue the conversation by replying in that threa
 
 ### Stopping a running task
 
-When the bot starts working, it adds a 🛑 reaction to the message that triggered the run. **Click that 🛑 reaction to stop the run** — the bot kills the task (and any subprocesses it spawned), posts `⏹️ Stopped.` in the thread, and discards the partial reply. The reaction is removed automatically once the run ends (whether you stopped it or it finished on its own).
+Click the 🛑 reaction to stop a run — the bot kills the task (and any subprocesses it spawned), posts `⏹️ Stopped.` in the thread, and discards the partial reply. The bot pre-adds a 🛑 you can click on:
 
-> Requires the `reactions:read` / `reactions:write` scopes and the `reaction_added` event from [docs/slack-setup.md](docs/slack-setup.md). If you set up the app before this feature existed, add them and reinstall the app.
+- **the live status message** — once it appears (with `LIVE_PROGRESS` on), the 🛑 lives there and is removed from the trigger message;
+- **the message that triggered the run** — used before the status message appears, or for the whole run when `LIVE_PROGRESS=false`.
+
+> Requires the `reactions:read` / `reactions:write` scopes and the `reaction_added` event from [docs/slack-setup.md](docs/slack-setup.md). No Slack Interactivity config is needed (stopping is a plain reaction, not a button). If you set up the app before this feature existed, add them and reinstall the app.
 
 → Full reference (channel formats, `plugin_dir`, worktrees, routing rules): **[docs/slack-to-claude-projects.md](docs/slack-to-claude-projects.md)**
 

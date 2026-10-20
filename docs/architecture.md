@@ -45,7 +45,8 @@ Multiple concurrent sessions each have their own `docker exec` process and their
 2. **Daemon receives the event** via Socket Mode and looks up the channel in `projects.json` to find the matching project directory (and optional `plugin_dir`).
 3. **Daemon parses an optional `[label]` prefix** — if present and the label resolves to a sibling git checkout, the daemon routes the run to that worktree instead of the channel's default `path`. See [slack-to-claude-projects.md](slack-to-claude-projects.md#worktrees) for the full rules.
 4. **Daemon spawns `claude -p`** in the resolved working directory, streaming `--output-format stream-json --verbose` so the daemon can forward assistant text, thinking, and tool calls to Slack as they arrive.
-5. **Daemon posts the response** as a thread reply on the original message. Subsequent replies in that thread are routed back into the same session.
+5. **Daemon shows live progress** — while the run works it edits one status message in the thread (recent actions, todos, changed files, and a resource/cost/context line), all derived from that same event stream with no extra model calls. A run has no wall-clock limit; it ends when it finishes, you stop it with 🛑, or it goes idle past `IDLE_TIMEOUT_SECONDS`. Toggle with `LIVE_PROGRESS`.
+6. **Daemon posts the final response** as a thread reply on the original message. Subsequent replies in that thread are routed back into the same session.
 
 ---
 

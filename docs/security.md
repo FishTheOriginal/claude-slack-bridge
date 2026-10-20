@@ -21,6 +21,12 @@ Recommended posture for shared workspaces: `SECURITY_ENABLED=true`, `SECURITY_ST
 
 ---
 
+## Secret redaction in Slack output
+
+Before run output is shown in Slack — both the live status message and the final reply — the daemon masks credential-shaped text as `[redacted]`: passwords, tokens, API keys, `--password=…` / `--token=…` style flags, and long high-entropy (random-looking) strings. It deliberately errs toward over-redaction. Treat it as a display-time safety net, not a licence to keep secrets in prompts or repositories.
+
+---
+
 ## `.env` (daemon — set once, shared across all projects)
 
 | Variable | Required | Description |

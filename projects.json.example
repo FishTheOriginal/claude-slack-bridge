@@ -9,6 +9,7 @@
   },
 
   "C012AB3CD45": {
-    "path": "/path/to/project"
+    "path": "/path/to/project",
+    "model": "fable"
   }
 }

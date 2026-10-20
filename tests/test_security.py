@@ -9,6 +9,7 @@ from security import (
     SecurityConfig,
     _parse_bool,
     _parse_id_set,
+    redact_secrets,
 )
 
 
@@ -230,3 +231,63 @@ class TestDenialLogging:
         with caplog.at_level(logging.WARNING, logger="security"):
             ac.is_allowed("U1", "C1")
         assert not any("Access denied" in r.message for r in caplog.records)
+
+
+# ---------- redact_secrets ----------
+
+class TestRedactSecrets:
+    def test_masks_high_entropy_env_token(self):
+        # The exact leak the user reported: a one-letter var with a long token value.
+        s = "T=ogk2r42gpi01pe7vwd4ljgdmhow3ye69vjrfi91asy4n3uyj; for d in 2026-06-25"
+        out = redact_secrets(s)
+        assert "ogk2r42gpi01pe7" not in out
+        assert "[redacted]" in out
+        assert "for d in 2026-06-25" in out  # the rest stays readable
+
+    def test_masks_named_credentials(self):
+        assert "hunter2" not in redact_secrets("mysql --password=hunter2longvalue db")
+        assert "s3cr3tvalue" not in redact_secrets("token: s3cr3tvalue")
+        assert "topsecretkey" not in redact_secrets("ANTHROPIC_API_KEY=topsecretkey123")
+        assert "bottoken" not in redact_secrets("GITHUB_TOKEN=bottoken value")
+
+    def test_masks_auth_headers_and_bearer(self):
+        out = redact_secrets("curl -H 'Authorization: Bearer abcdef0123456789xyz'")
+        assert "abcdef0123456789xyz" not in out
+
+    @pytest.mark.parametrize("token", [
+        # Built from two pieces so secret scanners don't flag this fake token.
+        "xoxb-" + "1234567890-abcdefghijklmnop",
+        "sk-ant-api03-abc123DEF456ghi789JKL012",
+        "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345",
+        "AKIAIOSFODNN7EXAMPLE",
+    ])
+    def test_masks_known_provider_key_formats(self, token):
+        assert token not in redact_secrets(f"deploy with {token} now")
+
+    @pytest.mark.parametrize("benign", [
+        "git status",
+        "ssh -p 2222 node@host",
+        "find . -name '*.py' -print",
+        "cat /home/node/proj/x.py | tail -10",
+        "run with COUNT=100 and NAME=alice",
+        "VERSION=1.2.3 build",
+        "the monkey=12 sat on a wall",
+        # Long, structured-but-not-secret values must survive the entropy pass —
+        # the exact over-redaction the user flagged (RUN=/OUT= paths, versions).
+        "OUT=/home/node/proj/meridian-dashboard/.pdfbuild",
+        "RUN=build-2026-06-30-nightly-01 make",
+        "TAG=v1.2.3-rc4-linux-x86_64 release",
+        "DIR=meridian-dashboard-staging-env deploy",
+    ])
+    def test_leaves_benign_text_untouched(self, benign):
+        assert redact_secrets(benign) == benign
+
+    def test_masks_unnamed_high_entropy_token_only_when_random(self):
+        # Entropy is the axis: a random blob is masked, a same-length readable
+        # value is not, without any name/format hint.
+        assert "[redacted]" in redact_secrets("X=Zk9pQ2mVr7Ht4Lx8Nw3Bc6Df1Gy5Js0")
+        assert redact_secrets("PATH=usr-local-bin-node-modules-cache") == \
+            "PATH=usr-local-bin-node-modules-cache"
+
+    def test_empty_string_is_safe(self):
+        assert redact_secrets("") == ""

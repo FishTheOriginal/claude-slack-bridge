@@ -39,7 +39,7 @@ def test_thread_reply_delivers_timeout_without_retry(tmp_path, monkeypatch):
 
     calls = []
 
-    async def fake_run(cmd, prompt, cwd=None, thread_ts=None, channel=None):
+    async def fake_run(cmd, prompt, cwd=None, thread_ts=None, channel=None, progress_cb=None):
         calls.append(prompt)
         return _TIMEOUT_REPLY
 
@@ -52,14 +52,14 @@ def test_thread_reply_delivers_timeout_without_retry(tmp_path, monkeypatch):
 
 
 def test_thread_reply_still_retries_genuine_failure(tmp_path, monkeypatch):
-    # The fix must not disable retry+scrape for genuine transient failures.
+    # The fix must not disable the retry for genuine transient failures.
     handler = _make_handler(tmp_path)
     _arm_resume_path(handler, tmp_path, monkeypatch)
 
     sentinel = "Sorry, I encountered an error processing your request."
     calls = []
 
-    async def fake_run(cmd, prompt, cwd=None, thread_ts=None, channel=None):
+    async def fake_run(cmd, prompt, cwd=None, thread_ts=None, channel=None, progress_cb=None):
         calls.append(prompt)
         return sentinel
 
@@ -71,5 +71,5 @@ def test_thread_reply_still_retries_genuine_failure(tmp_path, monkeypatch):
 
     reply = asyncio.run(handler.handle_thread_reply("C123", _THREAD, "x"))
 
-    assert reply == "scraped-ok"
-    assert len(calls) == 2  # initial + one retry, then scrape fallback
+    assert reply == sentinel  # error surfaced; the session is kept, not scraped
+    assert len(calls) == 2  # initial + one retry

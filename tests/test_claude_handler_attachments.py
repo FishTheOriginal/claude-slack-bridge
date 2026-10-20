@@ -19,7 +19,7 @@ class TestHandleMessageInjectsAttachments:
         h = _handler()
         captured = {}
 
-        async def fake_run(cmd, prompt, cwd=None, thread_ts=None, channel=None):
+        async def fake_run(cmd, prompt, cwd=None, thread_ts=None, channel=None, progress_cb=None):
             captured["prompt"] = prompt
             return "done"
 
@@ -42,7 +42,7 @@ class TestHandleMessageInjectsAttachments:
         h = _handler()
         captured = {}
 
-        async def fake_run(cmd, prompt, cwd=None, thread_ts=None, channel=None):
+        async def fake_run(cmd, prompt, cwd=None, thread_ts=None, channel=None, progress_cb=None):
             captured["prompt"] = prompt
             return "ok"
 
@@ -60,7 +60,7 @@ class TestHandleThreadReplyInjectsAttachments:
         monkeypatch.setattr(claude_handler, "_jsonl_path", lambda cwd, sid: Path(__file__))
         captured = {}
 
-        async def fake_run(cmd, prompt, cwd=None, thread_ts=None, channel=None):
+        async def fake_run(cmd, prompt, cwd=None, thread_ts=None, channel=None, progress_cb=None):
             captured["prompt"] = prompt
             return "ok"
 
@@ -85,7 +85,7 @@ class TestHandleThreadReplyInjectsAttachments:
         async def fake_build_prompt(channel, thread_ts):
             return "scraped history prompt"
 
-        async def fake_run(cmd, prompt, cwd=None, thread_ts=None, channel=None):
+        async def fake_run(cmd, prompt, cwd=None, thread_ts=None, channel=None, progress_cb=None):
             captured["prompt"] = prompt
             return "ok"
 
@@ -109,3 +109,20 @@ class TestSystemPromptDocumentsMarker:
         assert "@@attach" in prompt
         # Marker must be described as one absolute path per line.
         assert "absolute path" in prompt.lower()
+
+    def test_flow_b_prompt_explains_diff_display(self):
+        from claude_handler import _DIFF_PNG_TOOL
+
+        prompt = ClaudeHandler._FLOW_B_SYSTEM_PROMPT
+        assert "```diff" in prompt
+        # Phone-version renderer is named by an absolute path that exists.
+        assert str(_DIFF_PNG_TOOL) in prompt
+        assert _DIFF_PNG_TOOL.is_absolute() and _DIFF_PNG_TOOL.is_file()
+
+class TestSystemPromptTurnLifetime:
+    def test_every_spawn_tells_claude_to_wait_on_launched_work(self):
+        cmd = ClaudeHandler._build_cmd(session_id="s1")
+        prompt = cmd[cmd.index("--append-system-prompt") + 1]
+        assert prompt.startswith(ClaudeHandler._FLOW_B_SYSTEM_PROMPT)
+        assert ClaudeHandler._TURN_LIFETIME_RULE in prompt
+        assert "Never end your turn while work you launched is still running" in prompt

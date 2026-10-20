@@ -16,6 +16,8 @@ the Claude Code CLI, and the response is posted back as a thread reply.
 import asyncio
 import logging
 import os
+import signal
+from pathlib import Path
 from typing import Any
 
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
@@ -23,7 +25,12 @@ from slack_bolt.async_app import AsyncApp
 from slack_sdk.errors import SlackApiError
 
 import attachments
-from claude_handler import ClaudeHandler
+from claude_handler import (
+    ClaudeHandler,
+    _INTERRUPTED_REPLY,
+    _RUN_FAILURE_SENTINELS,
+    _TIMEOUT_REPLY,
+)
 from crash_recovery import recover_interrupted_runs
 from security import AccessControl, SecurityConfig
 from slack_markdown import build_markdown_payloads
@@ -31,6 +38,246 @@ from slack_markdown import build_markdown_payloads
 logger = logging.getLogger(__name__)
 
 SOCKET_PATH = "/tmp/slack-bridge.sock"
+
+# LIVE_PROGRESS on (default): post a live-updating status message; the bot adds a
+# 🛑 reaction to that message (clicking it stops the run, same as the trigger
+# reaction) and removes the now-redundant reaction from the trigger message. Off:
+# no status message — stop stays the 🛑 reaction on the trigger message for the
+# whole run (old behaviour). Reactions need no Slack Interactivity config.
+LIVE_PROGRESS = os.environ.get("LIVE_PROGRESS", "true").strip().lower() not in (
+    "0", "false", "no", "off",
+)
+
+# Replies that mean the run failed/stalled rather than producing an answer.
+# When one is returned, the live status message is removed so only the error
+# reply remains in the thread.
+_TERMINAL_ERRORS: frozenset[str] = _RUN_FAILURE_SENTINELS | {
+    _TIMEOUT_REPLY, _INTERRUPTED_REPLY,
+}
+
+
+def _meta_context_block(meta: str) -> "dict | None":
+    """The muted (small, grey) context block for the meta/stats line.
+
+    Shared by the live status message and the final reply so both render the
+    exact same dimmed line — Slack context blocks are the only native muted look
+    (mrkdwn has no per-word colour). Returns None when there's no meta to show.
+    """
+    if not meta:
+        return None
+    return {"type": "context", "elements": [{"type": "mrkdwn", "text": meta}]}
+
+
+def _rich_runs(line: str) -> list[dict]:
+    """Split one status line into rich_text runs, honouring our two inline styles:
+    ``*bold*`` and ``` `code` ```. Everything else (emoji, plain text) is a plain
+    run. Our status strings only ever use those two markers, so a tiny toggling
+    tokenizer is enough — no general markdown parser needed."""
+    runs: list[dict] = []
+    buf = ""
+    bold = code = False
+
+    def flush() -> None:
+        nonlocal buf
+        if not buf:
+            return
+        style = {}
+        if bold:
+            style["bold"] = True
+        if code:
+            style["code"] = True
+        run = {"type": "text", "text": buf}
+        if style:
+            run["style"] = style
+        runs.append(run)
+        buf = ""
+
+    for ch in line:
+        if ch == "*" and not code:
+            flush()
+            bold = not bold
+        elif ch == "`":
+            flush()
+            code = not code
+        else:
+            buf += ch
+    flush()
+    return runs
+
+
+def _rich_text_block(text: str) -> dict:
+    """Render our status mrkdwn as a Slack ``rich_text`` block.
+
+    Unlike a ``section``, a ``rich_text`` block is never given Slack's own "Show
+    more" collapse, so the todos checklist / subagents list always shows in full
+    at normal size — a ``section`` collapses into a box once it grows tall. Lines
+    are joined with newline runs inside one ``rich_text_section``.
+    """
+    elements: list[dict] = []
+    for i, line in enumerate(text.split("\n")):
+        if i:
+            elements.append({"type": "text", "text": "\n"})
+        elements.extend(_rich_runs(line))
+    return {"type": "rich_text",
+            "elements": [{"type": "rich_text_section", "elements": elements}]}
+
+
+# Banner at the top of the RUNNING status so its frequent in-place edits aren't
+# mistaken for the actual reply (which posts as a separate message when the run
+# ends). Plain text after the bold "Working…": it rides inside the rich_text header
+# (for the blank-line gap), and the converter only styles * and ` — not _ (content
+# can contain underscores). The DONE render tags its summary with _DONE_TAG instead.
+_LIVE_BANNER = "🔄 *Working…*  ·  live status — not the reply"
+_DONE_TAG = "  ·  not the reply"
+
+
+def _reply_footer_blocks(reporter: "Any | None") -> list[dict]:
+    """Blocks appended under the final reply so it carries the run's summary once
+    the live status is removed: the changed-files list, then the dimmed meta line
+    (total actions + per-tool, 🤖 subagents, 🧩 skills, tokens, ctx, model).
+
+    The reporter is the run's summary authority — _run_claude always hands it a
+    terminal done snapshot, so last_progress is set by reply time. Empty list when
+    there's no run data (short/trivial run, or LIVE_PROGRESS off).
+    """
+    p = getattr(reporter, "last_progress", None) if reporter is not None else None
+    if p is None:
+        return []
+    blocks: list[dict] = []
+    files = getattr(p, "files", "")
+    if files:
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": files}})
+    meta = _meta_context_block(getattr(p, "meta", ""))
+    if meta:
+        blocks.append(meta)
+    return blocks
+
+
+class _ProgressReporter:
+    """Posts and live-edits ONE Slack status message for a running Claude job.
+
+    Handed to :class:`ClaudeHandler` as its ``progress_cb``. The first snapshot
+    creates the message; later snapshots edit it in place — no new posts, so no
+    thread spam. A ``done`` snapshot collapses it into the summary. On stop or
+    error the daemon calls :meth:`delete` so only the final reply remains.
+
+    Stopping is a 🛑 *reaction* on this message (added by the daemon via the
+    ``on_status_posted`` hook), not an inline button — so no Slack Interactivity
+    is required. ``posted_ts`` persists after :meth:`delete` so the daemon can
+    unwind that reaction mapping; ``present`` says whether the message still exists.
+    """
+
+    def __init__(
+        self, client: Any, channel: str, thread_ts: str,
+        on_status_posted: "Any | None" = None,
+    ) -> None:
+        self._client = client
+        self._channel = channel
+        self._thread_ts = thread_ts
+        # Called once with the status message ts the first time it appears, so the
+        # daemon can wire 🛑-reaction stopping onto it and drop the trigger one.
+        self._on_status_posted = on_status_posted
+        self._status_ts: str | None = None
+        self.posted_ts: str | None = None  # set on first post; kept after delete
+        self.last_meta: str = ""           # latest meta line, reused under the reply
+        self.last_progress: Any = None     # latest snapshot, for the reply footer
+
+    @property
+    def present(self) -> bool:
+        """True while the status message still exists (not deleted)."""
+        return self._status_ts is not None
+
+    def _live_blocks(self, progress: Any, banner: str = "") -> list[dict]:
+        """Order: todos, subagents, recent actions, changed files, errors, resources.
+
+        Todos+subagents (with the banner and Actions title) share ONE ``rich_text``
+        block, and the action log is its own ``rich_text`` block right below: a
+        mrkdwn ``section`` gets Slack's own "Show more" fold once it grows tall,
+        and that fold RESETS to collapsed on every ~10s edit — reading as flicker —
+        so nothing that updates in place may be a tall section. ``rich_text`` is
+        never collapsed. Size stays sane because snapshot() already caps the log
+        text (_ACTIONS_CHARS) before it gets here. The changed-files list stays a
+        ``section`` (it only grows slowly; collapsing it is fine). The error DETAIL
+        block sits last, just above the meta, so it tucks under the primary
+        actions/files; it is live-only — the reply footer keeps just the count
+        (in the dimmed meta). Resources are a grey context block.
+        """
+        def section(text: str) -> dict:
+            return {"type": "section", "text": {"type": "mrkdwn", "text": text}}
+
+        blocks: list[dict] = []
+        # Todos, subagents, and the Actions TITLE all ride in ONE rich_text block,
+        # each separated by a blank line. rich_text preserves the "\n\n" gap; the
+        # action log is a SEPARATE rich_text block so its every-10s rewrite can't
+        # visually disturb the checklist above. Adjacent blocks render flush, so
+        # the log sits directly under its title, and every gap
+        # (todos↕subagents↕Actions) is the same blank line.
+        heads = [banner] if banner else []                # running-status banner, if any
+        heads += [t for t in (getattr(progress, "todos", ""),
+                              getattr(progress, "subagents", "")) if t]
+        heads.append("🛠️ *Actions*")
+        blocks.append(_rich_text_block("\n\n".join(heads)))
+        blocks.append(_rich_text_block(progress.live))    # action log — never collapses
+        if getattr(progress, "files", ""):
+            blocks.append(section(progress.files))
+        if getattr(progress, "errors", ""):            # last detail before the meta
+            blocks.append(section(progress.errors))
+        meta_block = _meta_context_block(progress.meta)
+        if meta_block:
+            blocks.append(meta_block)                      # grey, small, but visible
+        return blocks
+
+    async def __call__(self, progress: Any) -> None:
+        # Remember the latest snapshot so the daemon can rebuild the run's summary
+        # (meta + changed files) under the final reply (see _reply_footer_blocks).
+        self.last_progress = progress
+        if getattr(progress, "meta", ""):
+            self.last_meta = progress.meta
+        # Fast run: it finished before any live status was posted, so we keep its
+        # meta (above) for the reply line but do NOT spawn a brand-new "done"
+        # status message — that would be the spam short runs are meant to avoid.
+        if progress.done and self._status_ts is None:
+            return
+        # Done -> the summary rides as the header's first line (bold), then the FULL
+        # live view below. Folding it into the rich_text header (rather than a separate
+        # section) gives it the same blank-line gap before the checklist. delete() can
+        # lag, so the summary carries _DONE_TAG — even a lingering done window reads as
+        # "not the reply". Whole line bold via * (the converter styles */`, not _).
+        if progress.done:
+            text = progress.summary
+            blocks = self._live_blocks(
+                progress, banner=f"*{progress.summary}{_DONE_TAG}*")
+        else:
+            text = progress.live
+            # Banner folded into the rich_text header (first line, blank line before the
+            # checklist) so this frequently-updating window isn't mistaken for the reply.
+            blocks = self._live_blocks(progress, banner=_LIVE_BANNER)
+        if self._status_ts is None:
+            resp = await self._client.chat_postMessage(
+                channel=self._channel, thread_ts=self._thread_ts, text=text, blocks=blocks,
+            )
+            self._status_ts = resp["ts"]
+            self.posted_ts = resp["ts"]
+            if self._on_status_posted is not None:
+                try:
+                    await self._on_status_posted(self.posted_ts)
+                except Exception as exc:  # noqa: BLE001 — best-effort cleanup
+                    logger.warning("on_status_posted hook failed: %s", exc)
+        else:
+            await self._client.chat_update(
+                channel=self._channel, ts=self._status_ts, text=text, blocks=blocks,
+            )
+
+    async def delete(self) -> None:
+        """Remove the status message if one was posted. Best-effort."""
+        if self._status_ts is None:
+            return
+        try:
+            await self._client.chat_delete(channel=self._channel, ts=self._status_ts)
+        except Exception as exc:  # noqa: BLE001 — cleanup must not raise
+            logger.warning("Failed to delete status message %s: %s", self._status_ts, exc)
+        finally:
+            self._status_ts = None
 
 
 class SlackDaemon:
@@ -62,6 +309,40 @@ class SlackDaemon:
         self._app.event("app_mention")(self._handle_app_mention)
         self._app.event("reaction_added")(self._handle_reaction_added)
 
+    def _reload_security(self) -> str:
+        """Re-read .env and rebuild access control, live (no restart).
+
+        security.py reads os.environ once at startup (run-daemon.sh exports .env
+        before exec). To apply SECURITY_* edits — e.g. adding a channel to the
+        allowlist — without a restart, we re-read the .env file into os.environ
+        and rebuild _access_control, so the same RELOAD that refreshes
+        projects.json also refreshes the allowlist. ponytail: reads .env from the
+        repo root — native pm2 deploy only; in Docker the file isn't in the
+        container (env is injected at start), so this is a no-op there — restart
+        to apply.
+        """
+        from dotenv import dotenv_values
+
+        env_path = Path(__file__).resolve().parent.parent / ".env"
+        if not env_path.exists():
+            # Docker injects env at start; no file to re-read, so don't pretend.
+            return "security: no .env file — restart to apply"
+        # Only SECURITY_* is reloadable: scope the blast radius so a RELOAD can't
+        # push unrelated .env edits (tokens, half-saves) into os.environ, which
+        # spawned Claude sessions inherit via os.environ.copy().
+        values = {k: v for k, v in dotenv_values(env_path).items()
+                  if k.startswith("SECURITY_") and v is not None}
+        # Drop SECURITY_* keys no longer in the file so DELETING a line clears it —
+        # dotenv only reports present keys, so without this the old value would
+        # ghost in os.environ until the next restart.
+        for stale in [k for k in os.environ if k.startswith("SECURITY_") and k not in values]:
+            del os.environ[stale]
+        os.environ.update(values)
+        cfg = SecurityConfig.from_env()
+        self._access_control = AccessControl(cfg)
+        return (f"security: enabled={cfg.enabled} "
+                f"channels={len(cfg.allowed_channels)} users={len(cfg.allowed_users)}")
+
     async def _handle_slack_message(self, event: dict[str, Any]) -> None:
         # Filter: Ignore bot messages (prevents self-echo loops).
         if event.get("bot_id"):
@@ -87,6 +368,12 @@ class SlackDaemon:
         text: str = event.get("text", "")
         raw_files: list[dict] = event.get("files") or []
         event_ts: str = event.get("ts", "")
+
+        if thread_ts:
+            # A thread reply needs no mention; drop a leading one (and spaces) so
+            # "@bot /cmd …" or " /cmd …" (Slack blocks a bare "/cmd") reaches
+            # Claude Code as a real /command.
+            text = text.lstrip().removeprefix(f"<@{self._bot_user_id}>").lstrip()
 
         # Case 1: Threaded reply WITH a pending MCP session — forward to session.
         if thread_ts:
@@ -150,7 +437,11 @@ class SlackDaemon:
         await self._handle_slack_message(event)
 
     async def _handle_reaction_added(self, event: dict[str, Any]) -> None:
-        """Stop a running Flow-B agent when a non-bot user reacts 🛑 to its trigger."""
+        """Stop a running Flow-B agent when a non-bot user reacts 🛑 to it.
+
+        Works for the 🛑 on the trigger message and the one the bot puts on the
+        live status message — both ts values map to the run in _trigger_to_thread.
+        """
         if event.get("reaction") != "octagonal_sign":
             return
         if event.get("user") == self._bot_user_id:
@@ -174,6 +465,34 @@ class SlackDaemon:
         except Exception as exc:
             logger.warning("Failed to post stop notice for %s: %s", thread_ts, exc)
 
+    def _make_reporter(
+        self, channel: str, thread_ts: str, trigger_ts: str
+    ) -> "_ProgressReporter | None":
+        """Build a live-progress reporter, or None when LIVE_PROGRESS is off."""
+        if not LIVE_PROGRESS:
+            return None
+
+        async def _on_status_posted(status_ts: str) -> None:
+            # Move 🛑-reaction stopping onto the status message: reacting 🛑 on it
+            # resolves to this run, and the now-redundant trigger reaction is dropped.
+            self._trigger_to_thread[status_ts] = thread_ts
+            await self._add_stop_reaction(channel, status_ts)
+            await self._remove_stop_reaction(channel, trigger_ts)
+
+        return _ProgressReporter(
+            self._app.client, channel, thread_ts, on_status_posted=_on_status_posted,
+        )
+
+    async def _unwind_status_stop(
+        self, channel: str, reporter: "_ProgressReporter | None"
+    ) -> None:
+        """At run end, unwire status-message stopping and tidy its 🛑 reaction."""
+        if reporter is None or reporter.posted_ts is None:
+            return
+        self._trigger_to_thread.pop(reporter.posted_ts, None)
+        if reporter.present:  # message survives as the summary -> remove the 🛑
+            await self._remove_stop_reaction(channel, reporter.posted_ts)
+
     async def _handle_claude_new_message(
         self, channel: str, message_ts: str, text: str, trigger_ts: str,
         raw_files: list[dict] | None = None,
@@ -181,23 +500,39 @@ class SlackDaemon:
         """Spawn Claude for a new top-level message and post the response as a thread reply."""
         self._active_threads.add(message_ts)
         self._trigger_to_thread[trigger_ts] = message_ts
+        # The 🛑 reaction covers the window before the live status message (with
+        # its own button) appears; when LIVE_PROGRESS is off it stays the whole run.
         await self._add_stop_reaction(channel, trigger_ts)
+        reporter = self._make_reporter(channel, message_ts, trigger_ts)
         try:
             files = await attachments.download_files(
                 raw_files or [], message_ts, self._bot_token
             )
-            response = await self._claude.handle_message(channel, message_ts, text, files)
+            response = await self._claude.handle_message(
+                channel, message_ts, text, files, progress_cb=reporter
+            )
             if message_ts in self._claude._stopped:
                 logger.info("Run for %s was stopped; suppressing reply.", message_ts)
+                if reporter:
+                    await reporter.delete()
             else:
-                await self._deliver_response(channel, message_ts, response)
+                footer = [] if response in _TERMINAL_ERRORS else _reply_footer_blocks(reporter)
+                await self._deliver_response(
+                    channel, message_ts, response, footer_blocks=footer,
+                )
+                # The reply now carries the run summary, so drop the live status.
+                if reporter:
+                    await reporter.delete()
         except Exception as exc:
             logger.error("Error handling top-level message %s: %s", message_ts, exc)
+            if reporter:
+                await reporter.delete()
         finally:
             # Clear the stopped flag on EVERY exit path (incl. exceptions), so a
             # later run on this thread_ts is not silently suppressed.
             self._claude._stopped.discard(message_ts)
             await self._remove_stop_reaction(channel, trigger_ts)
+            await self._unwind_status_stop(channel, reporter)
             self._trigger_to_thread.pop(trigger_ts, None)
             self._active_threads.discard(message_ts)
 
@@ -209,31 +544,49 @@ class SlackDaemon:
         self._active_threads.add(thread_ts)
         self._trigger_to_thread[trigger_ts] = thread_ts
         await self._add_stop_reaction(channel, trigger_ts)
+        reporter = self._make_reporter(channel, thread_ts, trigger_ts)
         try:
             files = await attachments.download_files(
                 raw_files or [], thread_ts, self._bot_token
             )
-            response = await self._claude.handle_thread_reply(channel, thread_ts, text, files)
+            response = await self._claude.handle_thread_reply(
+                channel, thread_ts, text, files, progress_cb=reporter
+            )
             if thread_ts in self._claude._stopped:
                 logger.info("Run for %s was stopped; suppressing reply.", thread_ts)
+                if reporter:
+                    await reporter.delete()
             else:
-                await self._deliver_response(channel, thread_ts, response)
+                footer = [] if response in _TERMINAL_ERRORS else _reply_footer_blocks(reporter)
+                await self._deliver_response(
+                    channel, thread_ts, response, footer_blocks=footer,
+                )
+                # The reply now carries the run summary, so drop the live status.
+                if reporter:
+                    await reporter.delete()
         except Exception as exc:
             logger.error("Error in thread continuation %s: %s", thread_ts, exc)
+            if reporter:
+                await reporter.delete()
         finally:
             # Clear the stopped flag on EVERY exit path (incl. exceptions), so a
             # later run on this thread_ts is not silently suppressed.
             self._claude._stopped.discard(thread_ts)
             await self._remove_stop_reaction(channel, trigger_ts)
+            await self._unwind_status_stop(channel, reporter)
             self._trigger_to_thread.pop(trigger_ts, None)
             self._active_threads.discard(thread_ts)
 
-    async def _deliver_response(self, channel: str, thread_ts: str, response: str) -> None:
+    async def _deliver_response(
+        self, channel: str, thread_ts: str, response: str,
+        footer_blocks: "list[dict] | None" = None,
+    ) -> None:
         """Upload any ``@@attach`` files from *response*, then post the rest.
 
         Marker lines are parsed out, existing paths are ``files_upload_v2``'d into
         the thread, and the cleaned text is posted via ``_post_response``. When no
-        text remains after stripping, no text message is posted.
+        text remains after stripping, no text message is posted. *footer_blocks* is
+        the run summary (changed files + meta) appended below the last reply chunk.
         """
         text, paths = attachments.parse_attach_markers(response)
         if paths:
@@ -241,7 +594,7 @@ class SlackDaemon:
                 self._app.client, channel=channel, thread_ts=thread_ts, paths=paths
             )
         if text:
-            await self._post_response(channel, thread_ts, text)
+            await self._post_response(channel, thread_ts, text, footer_blocks=footer_blocks)
 
     async def _add_stop_reaction(self, channel: str, trigger_ts: str) -> None:
         """Add the 🛑 reaction marking a run as stoppable. Best-effort."""
@@ -261,13 +614,21 @@ class SlackDaemon:
         except Exception as exc:
             logger.warning("Failed to remove stop reaction on %s: %s", trigger_ts, exc)
 
-    async def _post_response(self, channel: str, thread_ts: str, text: str) -> None:
+    async def _post_response(
+        self, channel: str, thread_ts: str, text: str,
+        footer_blocks: "list[dict] | None" = None,
+    ) -> None:
         """Post a response to Slack, rendering Markdown via a markdown block.
 
         Long replies are split under Slack's per-message markdown limit; each
-        piece is posted in the same thread.
+        piece is posted in the same thread. *footer_blocks* (when present) — the
+        run summary (changed files + dimmed meta) — is appended under the LAST
+        piece, so the whole recap rides on the final reply message.
         """
-        for payload in build_markdown_payloads(text):
+        payloads = build_markdown_payloads(text)
+        if footer_blocks and payloads:
+            payloads[-1].setdefault("blocks", []).extend(footer_blocks)
+        for payload in payloads:
             try:
                 await self._app.client.chat_postMessage(
                     channel=channel, thread_ts=thread_ts, **payload
@@ -295,6 +656,21 @@ class SlackDaemon:
             line = await asyncio.wait_for(reader.readline(), timeout=10.0)
             parts = line.decode().strip().split(" ", 1)
 
+            # RELOAD: re-read projects.json live (sent by reloadctl.py). Reply
+            # with a one-line summary so the CLI can confirm what loaded.
+            if parts and parts[0] == "RELOAD":
+                count = await self._claude.reload_projects()
+                sec = self._reload_security()
+                summary = f"reloaded {count} channel(s); {sec}"
+                missing = self._claude.missing_project_dirs()
+                if missing:
+                    summary += " — ⚠ {} with missing dir: {}".format(
+                        len(missing), ", ".join(p for _, p in missing)
+                    )
+                writer.write((summary + "\n").encode())
+                await writer.drain()
+                return
+
             if len(parts) != 2 or parts[0] != "REGISTER":
                 logger.warning("Bad session registration: %r", line)
                 return
@@ -318,10 +694,38 @@ class SlackDaemon:
             if not writer.is_closing():
                 writer.close()
 
+    def _install_reload_signal(self) -> None:
+        """Reload projects.json on SIGHUP — the ops idiom (``pm2 sendSignal SIGHUP``).
+
+        ``add_signal_handler`` schedules work on the running loop; the handler
+        itself can't be a coroutine, so it spawns a task. Guarded because
+        SIGHUP / ``add_signal_handler`` aren't available on every platform
+        (e.g. Windows) — the ``RELOAD`` socket verb still works there.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+            loop.add_signal_handler(
+                signal.SIGHUP,
+                lambda: asyncio.create_task(self._reload_projects_on_signal()),
+            )
+            logger.info("SIGHUP will reload projects.json (no restart).")
+        except (NotImplementedError, AttributeError, ValueError):
+            logger.info("SIGHUP reload unavailable on this platform; use the RELOAD socket verb.")
+
+    async def _reload_projects_on_signal(self) -> None:
+        """Run a projects.json reload triggered by SIGHUP, logging the outcome."""
+        try:
+            count = await self._claude.reload_projects()
+            sec = self._reload_security()
+            logger.info("SIGHUP reload complete: %d channel(s) mapped; %s", count, sec)
+        except Exception as exc:  # noqa: BLE001 — a failed reload must not crash the daemon
+            logger.error("SIGHUP reload failed: %s", exc)
+
     async def start(self) -> None:
         """Start the Unix socket server and Slack Socket Mode handler concurrently."""
         await self._claude.initialize()
         self._bot_user_id = self._claude._bot_user_id
+        self._install_reload_signal()
 
         try:
             recovered = await recover_interrupted_runs(self._app.client)

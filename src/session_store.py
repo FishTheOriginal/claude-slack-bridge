@@ -14,7 +14,9 @@ Record shape per thread_ts::
         "cwd": "/abs/project/path" | null,
         "plugin_dir": "/abs/plugin/path" | null,
         "in_flight": false,
-        "pid": null
+        "pid": null,
+        "model": "fable" | null,       # the thread's model pick
+        "ctx_tokens": 450000 | null    # prompt size of the last finished run
     }
 
 All writes are atomic: a temp file in the same directory is written and fsync'd,
@@ -32,7 +34,7 @@ logger = logging.getLogger(__name__)
 
 SESSIONS_PATH = Path(__file__).parent.parent / "data" / "sessions.json"
 
-# Sentinel so callers can distinguish "don't touch pid" from "set pid to None".
+# Sentinel so callers can distinguish "don't touch pid/model" from "set it to None".
 _UNSET: Any = object()
 
 
@@ -44,6 +46,11 @@ def _default_record() -> dict[str, Any]:
         "in_flight": False,
         "pid": None,
         "channel": None,
+        "ctx_pct": None,   # last run's context % of the model window
+        "ctx_nudged": 0,   # highest severity band the agent has been nudged at
+        "cum_cost": 0.0,   # unrounded USD spent across all messages in the thread
+        "model": None,
+        "ctx_tokens": None,
     }
 
 
@@ -64,16 +71,25 @@ def load(path: Path | None = None) -> dict[str, dict]:
     return data
 
 
-def save(data: dict[str, dict], path: Path | None = None) -> None:
-    """Atomically write *data* as JSON (temp file + os.replace)."""
+def save(
+    data: dict[str, dict], path: Path | None = None, *,
+    ensure_ascii: bool = True, mode: int | None = None,
+) -> None:
+    """Atomically write *data* as JSON (temp file + os.replace).
+
+    ``ensure_ascii=False`` keeps non-ASCII text as UTF-8 instead of ``\\u``
+    escapes; *mode* sets the file's permission bits (the temp file is 0600).
+    """
     path = path or SESSIONS_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".sessions-", suffix=".tmp")
     try:
-        with os.fdopen(fd, "w") as f:
-            json.dump(data, f, indent=2)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=ensure_ascii)
             f.flush()
             os.fsync(f.fileno())
+        if mode is not None:
+            os.chmod(tmp, mode)
         os.replace(tmp, path)
     except BaseException:
         # Don't leave a temp file behind if the write/replace fails.
@@ -93,13 +109,19 @@ def upsert(
     channel: str | None = None,
     in_flight: bool | None = None,
     pid: Any = _UNSET,
+    ctx_pct: Any = _UNSET,
+    ctx_nudged: "int | None" = None,
+    cum_cost: "float | None" = None,
+    model: Any = _UNSET,
+    ctx_tokens: int | None = None,
     path: Path | None = None,
 ) -> dict[str, dict]:
     """Merge the provided fields into ``thread_ts``'s record and persist.
 
     Only fields you pass are changed; omitted fields keep their stored value.
-    ``pid`` uses a sentinel default so ``pid=None`` can be written explicitly
-    (e.g. to clear a finished run) while omitting ``pid`` leaves it untouched.
+    ``pid`` and ``model`` use a sentinel default so ``None`` can be written
+    explicitly (e.g. to clear a finished run or a model pick) while omitting
+    them leaves them untouched.
 
     Returns the full updated map.
     """
@@ -118,6 +140,16 @@ def upsert(
         record["in_flight"] = in_flight
     if pid is not _UNSET:
         record["pid"] = pid
+    if ctx_pct is not _UNSET:
+        record["ctx_pct"] = ctx_pct
+    if ctx_nudged is not None:
+        record["ctx_nudged"] = ctx_nudged
+    if cum_cost is not None:
+        record["cum_cost"] = cum_cost
+    if model is not _UNSET:
+        record["model"] = model
+    if ctx_tokens is not None:
+        record["ctx_tokens"] = ctx_tokens
     data[thread_ts] = record
     save(data, path)
     return data
